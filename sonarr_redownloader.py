@@ -65,7 +65,7 @@ def contentRedownloader():
                 elif json.loads(completion_response.content)['state'] == "completed":
                     break
                 elif timeout_counter > MAX_TIMEOUT:
-                    print("Show is still processing after " + MAX_TIMEOUT + " seconds. Starting the next show.")
+                    print("Show is still processing after " + str(MAX_TIMEOUT) + " seconds. Starting the next show.")
                     break
 
 if __name__ == "__main__":
