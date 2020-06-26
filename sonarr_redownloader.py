@@ -19,8 +19,8 @@ def contentRedownloader():
     series_list = json.loads(get_series_response.content) # Turn the JSON into Python
 
     # Additional configuration values
-    print("\n  ** ex) /media/TV    or    /media    or    /")
-    root_dir = input("Directory path to upgrade: ")
+    print("\n  ** ex) /media/TV    or    /media")
+    root_dir = input("Root directory to upgrade (optional): ")
     max_episodes = input("Skip shows with more than _____ episodes (optional): ")
     if (int(max_episodes) <= 0) or (max_episodes == ""):
         max_episodes = 1000000
