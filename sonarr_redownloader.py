@@ -2,7 +2,7 @@ import requests
 import json
 from time import sleep
 
-MAX_TIMEOUT = 300 # Time in seconds
+MAX_TIMEOUT = 600 # Time in seconds
 
 def contentRedownloader():
     # Sonarr configuration values
@@ -21,10 +21,10 @@ def contentRedownloader():
     # Additional configuration values
     print("\n  ** ex) /media/TV    or    /media    or    /")
     root_dir = input("Directory path to upgrade: ")
-    max_episodes = input("Max amount of episodes to search per series (optional): ")
+    max_episodes = input("Skip shows with more than _____ episodes (optional): ")
     if (int(max_episodes) <= 0) or (max_episodes == ""):
         max_episodes = 1000000
-    starting_series = input("Series name to start at (optional): ")
+    starting_series = input("Show name to start at (optional): ")
 
     # Search for file upgrades in the directory
     counter = -1
@@ -40,7 +40,7 @@ def contentRedownloader():
             else:
                 starting_series = ""
             if series['episodeCount'] > int(max_episodes):
-                print("Too many episodes. Skipping...")
+                print("Show has more episodes than the limit. Skipping...")
                 continue
             
             # Command Sonarr to search
@@ -61,11 +61,11 @@ def contentRedownloader():
                 completion_response = requests.get(completion_url)
                 if completion_response.status_code != 200:
                     print("Completion check failed!")
-                    return False                                
+                    return False
                 elif json.loads(completion_response.content)['state'] == "completed":
                     break
                 elif timeout_counter > MAX_TIMEOUT:
-                    print("Took too long... moving on to the next series.")
+                    print("Show is still processing after " + MAX_TIMEOUT + " seconds. Starting the next show.")
                     break
 
 if __name__ == "__main__":
