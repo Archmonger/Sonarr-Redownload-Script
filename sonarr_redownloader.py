@@ -27,9 +27,9 @@ def contentRedownloader():
 
     # Additional configuration values
     print("\n  ** ex) /media/TV    or    /media")
-    root_dir = input("Root directory to upgrade (optional): ")
-    max_episodes = input("Skip shows with more than _____ episodes (optional): ")
-    if (int(max_episodes) <= 0) or (max_episodes == ""):
+    root_dir = str(input("Root directory to upgrade (optional): "))
+    max_episodes = int(input("Skip shows with more than _____ episodes (optional): "))
+    if (int(max_episodes) <= 0) or (str(max_episodes) == ""):
         max_episodes = 1000000
     starting_series = input("Show name to start at (optional): ")
     if str(input("Rapid mode [Y/N] (optional): ")).lower() == "y":
@@ -70,25 +70,25 @@ def contentRedownloader():
 
             # Wait for the search to complete
             if rapid_mode == False:
-            completion_url = sonarr_url + "/api/command/" + str(command_search_id) + "?apikey=" + api_key
-            timeout_counter = 0
-            while True:
-                sleep(1)
-                timeout_counter = timeout_counter + 1
-                completion_response = requests.get(completion_url)
-                retries = 0
-                while completion_response.status_code != 200:
-                    print("Completion check failed!")
-                    retries = retries + 1
-                    sleep(CONNECTION_RETRY_TIMEOUT)
+                completion_url = sonarr_url + "/api/command/" + str(command_search_id) + "?apikey=" + api_key
+                timeout_counter = 0
+                while True:
+                    sleep(1)
+                    timeout_counter = timeout_counter + 1
                     completion_response = requests.get(completion_url)
-                    if retries > MAX_CONNECTION_RETRIES:
-                        return False
-                if json.loads(completion_response.content)['state'] == "completed":
-                    break
-                elif timeout_counter > MAX_TIMEOUT:
-                    print("Show is still processing after " + str(MAX_TIMEOUT) + " seconds. Starting the next show.")
-                    break
+                    retries = 0
+                    while completion_response.status_code != 200:
+                        print("Completion check failed!")
+                        retries = retries + 1
+                        sleep(CONNECTION_RETRY_TIMEOUT)
+                        completion_response = requests.get(completion_url)
+                        if retries > MAX_CONNECTION_RETRIES:
+                            return False
+                    if json.loads(completion_response.content)['state'] == "completed":
+                        break
+                    elif timeout_counter > MAX_TIMEOUT:
+                        print("Show is still processing after " + str(MAX_TIMEOUT) + " seconds. Starting the next show.")
+                        break
 
 if __name__ == "__main__":
     contentRedownloader()
