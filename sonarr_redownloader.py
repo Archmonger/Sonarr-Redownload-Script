@@ -32,6 +32,10 @@ def contentRedownloader():
     if (int(max_episodes) <= 0) or (max_episodes == ""):
         max_episodes = 1000000
     starting_series = input("Show name to start at (optional): ")
+    if str(input("Rapid mode [Y/N] (optional): ")).lower() == "y":
+        rapid_mode = True
+    else:
+        rapid_mode = False
 
     # Search for file upgrades in the directory
     counter = -1
@@ -65,6 +69,7 @@ def contentRedownloader():
             command_search_id = json.loads(command_search_response.content)['id']
 
             # Wait for the search to complete
+            if rapid_mode == False:
             completion_url = sonarr_url + "/api/command/" + str(command_search_id) + "?apikey=" + api_key
             timeout_counter = 0
             while True:
