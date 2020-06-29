@@ -35,10 +35,11 @@ def contentRedownloader():
     except ValueError:
         max_episodes = 1000000
     starting_series = input("Show name to start at (optional): ")
+    rapid_mode = False
     if str(input("Rapid mode [Y/N] (optional): ")).lower() == "y":
-        rapid_mode = True
-    else:
-        rapid_mode = False
+        print("\nWARNING: Rapid immediately queues all search queries. This can overwhelm Sonarr, and is difficult to stop once started.")
+        if str(input("Are you sure? [Y/N]: ")).lower() == "y":
+            rapid_mode = True
 
     # Search for file upgrades in the directory
     counter = -1
