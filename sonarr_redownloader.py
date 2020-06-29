@@ -9,8 +9,8 @@ CONNECTION_RETRY_TIMEOUT = 10 # Time in seconds
 def contentRedownloader():
     # Sonarr configuration values
     print("\n  ** ex) http://192.168.86.20:8989")
-    sonarr_url = input("Sonarr URL: ")
-    api_key = input("Sonarr API key: ")
+    sonarr_url = str(input("Sonarr URL: "))
+    api_key = str(input("Sonarr API key: "))
 
     # Get a list of all series
     get_series_url = sonarr_url + "/api/series?apikey=" + api_key
