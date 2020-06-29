@@ -92,6 +92,10 @@ def contentRedownloader():
                     elif timeout_counter > MAX_TIMEOUT:
                         print("Show is still processing after " + str(MAX_TIMEOUT) + " seconds. Starting the next show.")
                         break
+    return True
 
 if __name__ == "__main__":
-    contentRedownloader()
+    if contentRedownloader():
+        print("Script successfully completed.")
+    else:
+        print("Script failed to complete.")
