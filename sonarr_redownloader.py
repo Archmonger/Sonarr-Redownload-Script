@@ -15,13 +15,13 @@ def contentRedownloader():
     # Get a list of all series
     get_series_url = sonarr_url + "/api/series?apikey=" + api_key
     get_series_response = requests.get(get_series_url)
-    retries = 0
+    connection_retries = 0
     while get_series_response.status_code != 200: 
         print("Failed communication with Sonarr!")
-        retries = retries + 1
+        connection_retries = connection_retries + 1
         sleep(CONNECTION_RETRY_TIMEOUT)
         get_series_response = requests.get(get_series_url)
-        if retries > MAX_CONNECTION_RETRIES:
+        if connection_retries > MAX_CONNECTION_RETRIES:
             return False
     series_list = json.loads(get_series_response.content) # Turn the JSON into Python
 
@@ -58,13 +58,13 @@ def contentRedownloader():
             command_search_url = sonarr_url + "/api/command?apikey=" + api_key
             command_search_parameters = {"name":"SeriesSearch", "seriesId":int(series['id'])}
             command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
-            retries = 0
+            connection_retries = 0
             while command_search_response.status_code != 201:
                 print("Search command failed!")
-                retries = retries + 1
+                connection_retries = connection_retries + 1
                 sleep(CONNECTION_RETRY_TIMEOUT)
                 command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
-                if retries > MAX_CONNECTION_RETRIES:
+                if connection_retries > MAX_CONNECTION_RETRIES:
                     return False
             command_search_id = json.loads(command_search_response.content)['id']
 
@@ -76,13 +76,13 @@ def contentRedownloader():
                     sleep(5)
                     timeout_counter = timeout_counter + 5
                     completion_response = requests.get(completion_url)
-                    retries = 0
+                    connection_retries = 0
                     while completion_response.status_code != 200:
                         print("Completion check failed!")
-                        retries = retries + 1
+                        connection_retries = connection_retries + 1
                         sleep(CONNECTION_RETRY_TIMEOUT)
                         completion_response = requests.get(completion_url)
-                        if retries > MAX_CONNECTION_RETRIES:
+                        if connection_retries > MAX_CONNECTION_RETRIES:
                             return False
                     if json.loads(completion_response.content)['state'] == "completed":
                         break
