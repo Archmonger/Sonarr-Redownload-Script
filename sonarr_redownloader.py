@@ -2,7 +2,7 @@ import requests
 import json
 from time import sleep
 
-MAX_TIMEOUT = 600 # Time in seconds
+MAX_TIMEOUT = 3600 # Time in seconds
 MAX_CONNECTION_RETRIES = 10 # Number of attempts
 CONNECTION_RETRY_TIMEOUT = 10 # Time in seconds
 
@@ -73,8 +73,8 @@ def contentRedownloader():
                 completion_url = sonarr_url + "/api/command/" + str(command_search_id) + "?apikey=" + api_key
                 timeout_counter = 0
                 while True:
-                    sleep(1)
-                    timeout_counter = timeout_counter + 1
+                    sleep(5)
+                    timeout_counter = timeout_counter + 5
                     completion_response = requests.get(completion_url)
                     retries = 0
                     while completion_response.status_code != 200:
