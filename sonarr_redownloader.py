@@ -46,12 +46,12 @@ def content_redownloader():
     # Search for file upgrades in the directory
     counter = -1
     for series in series_list:
-        if series['path'].startswith(root_dir):
+        if series['path'][:len(root_dir)] == root_dir:
             counter = counter + 1
             print(str(counter) + ": Processing " + series['title'])
 
             # Skip checks
-            if not starting_series.lower().startswith(series['title'].lower()):
+            if starting_series.lower() != series['title'].lower()[:len(starting_series)]:
                 print("Not starting series. Skipping...")
                 continue
             starting_series = ""
