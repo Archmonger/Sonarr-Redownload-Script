@@ -28,8 +28,11 @@ def contentRedownloader():
     # Additional configuration values
     print("\n  ** ex) /media/TV    or    /media")
     root_dir = str(input("Root directory to upgrade (optional): "))
-    max_episodes = int(input("Skip shows with more than _____ episodes (optional): "))
-    if (int(max_episodes) <= 0) or (str(max_episodes) == ""):
+    max_episodes = input("Skip shows with more than _____ episodes (optional): ")
+    try:
+        if int(max_episodes) <= 0:
+            max_episodes = 1000000
+    except ValueError:
         max_episodes = 1000000
     starting_series = input("Show name to start at (optional): ")
     if str(input("Rapid mode [Y/N] (optional): ")).lower() == "y":
