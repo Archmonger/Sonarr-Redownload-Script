@@ -1,12 +1,14 @@
-import requests
 import json
 from time import sleep
+
+import requests
 
 MAX_TIMEOUT = 3600 # Time in seconds
 MAX_CONNECTION_RETRIES = 10 # Number of attempts
 CONNECTION_RETRY_TIMEOUT = 10 # Time in seconds
 
-def contentRedownloader():
+def content_redownloader():
+    """Queries sonarr to upgrade content that match given parameters"""
     # Sonarr configuration values
     print("\n  ** ex) http://192.168.86.20:8989")
     sonarr_url = str(input("Sonarr URL: "))
@@ -16,7 +18,7 @@ def contentRedownloader():
     get_series_url = sonarr_url + "/api/series?apikey=" + api_key
     get_series_response = requests.get(get_series_url)
     connection_retries = 0
-    while get_series_response.status_code != 200: 
+    while get_series_response.status_code != 200:
         print("Failed communication with Sonarr!")
         connection_retries = connection_retries + 1
         sleep(CONNECTION_RETRY_TIMEOUT)
@@ -52,12 +54,11 @@ def contentRedownloader():
             if not starting_series.lower().startswith(series['title'].lower()):
                 print("Not starting series. Skipping...")
                 continue
-            else:
-                starting_series = ""
+            starting_series = ""
             if series['episodeCount'] > int(max_episodes):
                 print("Show has more episodes than the limit. Skipping...")
                 continue
-            
+
             # Command Sonarr to search
             command_search_url = sonarr_url + "/api/command?apikey=" + api_key
             command_search_parameters = {"name":"SeriesSearch", "seriesId":int(series['id'])}
@@ -73,7 +74,7 @@ def contentRedownloader():
             command_search_id = json.loads(command_search_response.content)['id']
 
             # Wait for the search to complete
-            if rapid_mode == False:
+            if not rapid_mode:
                 completion_url = sonarr_url + "/api/command/" + str(command_search_id) + "?apikey=" + api_key
                 timeout_counter = 0
                 while True:
@@ -90,13 +91,13 @@ def contentRedownloader():
                             return False
                     if json.loads(completion_response.content)['state'] == "completed":
                         break
-                    elif timeout_counter > MAX_TIMEOUT:
+                    if timeout_counter > MAX_TIMEOUT:
                         print("Show is still processing after " + str(MAX_TIMEOUT) + " seconds. Starting the next show.")
                         break
     return True
 
 if __name__ == "__main__":
-    if contentRedownloader():
+    if content_redownloader():
         print("Script successfully completed.")
     else:
         print("Script failed to complete.")
