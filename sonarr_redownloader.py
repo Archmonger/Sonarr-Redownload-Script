@@ -16,17 +16,19 @@ def content_redownloader():
 
     # Check connection to Sonarr and get a list of all series
     get_series_url = sonarr_url + "/api/series?apikey=" + api_key
-    try:
-        get_series_response = requests.get(get_series_url)
-    except:
-        pass
+    get_series_status = 404
+    connection_retries = 0
+    while get_series_status != 200:
+        try:
+            get_series_response = requests.get(get_series_url)
+            get_series_status = get_series_response.status_code
+            if get_series_status == 200:
+                break
+        except:
+            pass
         print("Failed communication with Sonarr! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
         connection_retries = connection_retries + 1
         sleep(CONNECTION_RETRY_TIMEOUT)
-        try:
-            get_series_response = requests.get(get_series_url)
-        except:
-            pass
         if connection_retries > MAX_CONNECTION_RETRIES:
             return False
     series_list = json.loads(get_series_response.content)
@@ -66,17 +68,19 @@ def content_redownloader():
             # Command Sonarr to perform a series search
             command_search_url = sonarr_url + "/api/command?apikey=" + api_key
             command_search_parameters = {"name":"SeriesSearch", "seriesId":int(series['id'])}
-            try:
-                command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
-            except:
-                pass
+            command_search_status = 404
+            connection_retries = 0
+            while command_search_status != 201:
+                try:
+                    command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
+                    command_search_status = command_search_response.status_code
+                    if command_search_status == 201:
+                        break
+                except:
+                    pass
                 print("Search command failed! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
                 connection_retries = connection_retries + 1
                 sleep(CONNECTION_RETRY_TIMEOUT)
-                try:
-                    command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
-                except:
-                    pass
                 if connection_retries > MAX_CONNECTION_RETRIES:
                     return False
             command_search_id = json.loads(command_search_response.content)['id']
@@ -88,17 +92,19 @@ def content_redownloader():
                 while True:
                     sleep(5)
                     timeout_counter = timeout_counter + 5
-                    try:
-                        completion_response = requests.get(completion_url)
-                    except:
-                        pass
+                    completion_status = 404
+                    connection_retries = 0
+                    while completion_status != 200:
+                        try:
+                            completion_response = requests.get(completion_url)
+                            completion_status = completion_response.status_code
+                            if completion_status == 200:
+                                break
+                        except:
+                            pass
                         print("Completion check failed! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
                         connection_retries = connection_retries + 1
                         sleep(CONNECTION_RETRY_TIMEOUT)
-                        try:
-                            completion_response = requests.get(completion_url)
-                        except:
-                            pass
                         if connection_retries > MAX_CONNECTION_RETRIES:
                             return False
                     if json.loads(completion_response.content)['state'] == "completed":
