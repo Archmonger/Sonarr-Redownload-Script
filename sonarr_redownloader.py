@@ -9,12 +9,12 @@ CONNECTION_RETRY_TIMEOUT = 10 # Time in seconds
 
 def content_redownloader():
     """Queries Sonarr to upgrade content that match the user's given parameters"""
-    # Sonarr configuration values
+    # Obtain Sonarr URL and API key
     print("\n  ** ex) http://192.168.86.20:8989")
     sonarr_url = str(input("Sonarr URL: "))
     api_key = str(input("Sonarr API key: "))
 
-    # Get a list of all series
+    # Check connection to Sonarr and get a list of all series
     get_series_url = sonarr_url + "/api/series?apikey=" + api_key
     try:
         get_series_response = requests.get(get_series_url)
@@ -33,7 +33,7 @@ def content_redownloader():
             return False
     series_list = json.loads(get_series_response.content)
 
-    # Additional configuration values
+    # Obtain user preferences
     print("\n  ** ex) /media/TV    or    /media")
     root_dir = str(input("Root directory to upgrade (optional): "))
     max_episodes = input("Skip shows with more than _____ episodes (optional): ")
@@ -49,14 +49,14 @@ def content_redownloader():
         if str(input("Are you sure? [Y/N]: ")).lower() == "y":
             rapid_mode = True
 
-    # Search for file upgrades in the directory
+    # Search for file upgrades
     counter = -1
     for series in series_list:
         if series['path'][:len(root_dir)] == root_dir:
             counter = counter + 1
             print(str(counter) + ": Processing " + series['title'])
 
-            # Skip checks
+            # Check if current series should be skipped
             if starting_series.lower() != series['title'].lower()[:len(starting_series)]:
                 print("Not starting series. Skipping...")
                 continue
@@ -65,7 +65,7 @@ def content_redownloader():
                 print("Show has more episodes than the limit. Skipping...")
                 continue
 
-            # Command Sonarr to search
+            # Command Sonarr to perform a series search
             command_search_url = sonarr_url + "/api/command?apikey=" + api_key
             command_search_parameters = {"name":"SeriesSearch", "seriesId":int(series['id'])}
             try:
