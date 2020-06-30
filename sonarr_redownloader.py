@@ -20,9 +20,7 @@ def content_redownloader():
         get_series_response = requests.get(get_series_url)
     except:
         pass
-    connection_retries = 0
-    while get_series_response.status_code != 200:
-        print("Failed communication with Sonarr!")
+        print("Failed communication with Sonarr! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
         connection_retries = connection_retries + 1
         sleep(CONNECTION_RETRY_TIMEOUT)
         try:
@@ -72,9 +70,7 @@ def content_redownloader():
                 command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
             except:
                 pass
-            connection_retries = 0
-            while command_search_response.status_code != 201:
-                print("Search command failed!")
+                print("Search command failed! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
                 connection_retries = connection_retries + 1
                 sleep(CONNECTION_RETRY_TIMEOUT)
                 try:
@@ -96,9 +92,7 @@ def content_redownloader():
                         completion_response = requests.get(completion_url)
                     except:
                         pass
-                    connection_retries = 0
-                    while completion_response.status_code != 200:
-                        print("Completion check failed!")
+                        print("Completion check failed! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
                         connection_retries = connection_retries + 1
                         sleep(CONNECTION_RETRY_TIMEOUT)
                         try:
