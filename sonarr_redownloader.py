@@ -58,7 +58,7 @@ def content_redownloader():
 
             # Check if current series should be skipped
             if starting_series.lower() != series['title'].lower()[:len(starting_series)]:
-                print("Not starting series. Skipping...")
+                print("This is not the requested starting show. Skipping...")
                 continue
             starting_series = ""
             if series['episodeCount'] > int(max_episodes):
