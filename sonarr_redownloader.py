@@ -18,7 +18,7 @@ def content_redownloader():
     get_series_url = sonarr_url + "/api/series?apikey=" + api_key
     try:
         get_series_response = requests.get(get_series_url)
-    except TimeoutError:
+    except:
         pass
     connection_retries = 0
     while get_series_response.status_code != 200:
@@ -27,7 +27,7 @@ def content_redownloader():
         sleep(CONNECTION_RETRY_TIMEOUT)
         try:
             get_series_response = requests.get(get_series_url)
-        except TimeoutError:
+        except:
             pass
         if connection_retries > MAX_CONNECTION_RETRIES:
             return False
@@ -40,7 +40,7 @@ def content_redownloader():
     try:
         if int(max_episodes) <= 0:
             max_episodes = 1000000
-    except ValueError:
+    except:
         max_episodes = 1000000
     starting_series = input("Show name to start at (optional): ")
     rapid_mode = False
@@ -70,7 +70,7 @@ def content_redownloader():
             command_search_parameters = {"name":"SeriesSearch", "seriesId":int(series['id'])}
             try:
                 command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
-            except TimeoutError:
+            except:
                 pass
             connection_retries = 0
             while command_search_response.status_code != 201:
@@ -79,7 +79,7 @@ def content_redownloader():
                 sleep(CONNECTION_RETRY_TIMEOUT)
                 try:
                     command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
-                except TimeoutError:
+                except:
                     pass
                 if connection_retries > MAX_CONNECTION_RETRIES:
                     return False
@@ -94,7 +94,7 @@ def content_redownloader():
                     timeout_counter = timeout_counter + 5
                     try:
                         completion_response = requests.get(completion_url)
-                    except TimeoutError:
+                    except:
                         pass
                     connection_retries = 0
                     while completion_response.status_code != 200:
@@ -103,7 +103,7 @@ def content_redownloader():
                         sleep(CONNECTION_RETRY_TIMEOUT)
                         try:
                             completion_response = requests.get(completion_url)
-                        except TimeoutError:
+                        except:
                             pass
                         if connection_retries > MAX_CONNECTION_RETRIES:
                             return False
