@@ -31,7 +31,7 @@ def content_redownloader():
             pass
         if connection_retries > MAX_CONNECTION_RETRIES:
             return False
-    series_list = json.loads(get_series_response.content) # Turn the JSON into Python
+    series_list = json.loads(get_series_response.content)
 
     # Additional configuration values
     print("\n  ** ex) /media/TV    or    /media")
