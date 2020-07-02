@@ -8,7 +8,7 @@ MAX_CONNECTION_RETRIES = 10 # Number of attempts
 CONNECTION_RETRY_TIMEOUT = 10 # Time in seconds
 
 def content_redownloader():
-    """Queries Sonarr to upgrade content that match the user's given parameters"""
+    """Have Sonarr perform a search in order to upgrade content."""
     # Obtain Sonarr URL and API key
     print("\n  ** ex) http://192.168.86.20:8989")
     sonarr_url = str(input("Sonarr URL: "))
