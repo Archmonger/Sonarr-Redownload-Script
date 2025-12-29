@@ -15,7 +15,7 @@ def content_redownloader():
     api_key = str(input("Sonarr API key: "))
 
     # Check connection to Sonarr and get a list of all series
-    get_series_url = sonarr_url + "/api/series?apikey=" + api_key
+    get_series_url = sonarr_url + "/api/v3/series?apikey=" + api_key
     get_series_status = 404
     connection_retries = 0
     while get_series_status != 200:
@@ -24,9 +24,9 @@ def content_redownloader():
             get_series_status = get_series_response.status_code
             if get_series_status == 200:
                 break
-        except:
+        except Exception:
             pass
-        print("Failed communication with Sonarr! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
+        print(f"Failed communication with Sonarr! Retrying in {CONNECTION_RETRY_TIMEOUT} seconds...")
         connection_retries = connection_retries + 1
         sleep(CONNECTION_RETRY_TIMEOUT)
         if connection_retries > MAX_CONNECTION_RETRIES:
@@ -40,12 +40,12 @@ def content_redownloader():
     try:
         if int(max_episodes) <= 0:
             max_episodes = 1000000
-    except:
+    except Exception:
         max_episodes = 1000000
     starting_series = input("Show name to start at (optional): ")
     rapid_mode = False
     if str(input("Rapid mode [Y/N] (optional): ")).lower() == "y":
-        print("\nWARNING: Rapid immediately queues all search queries. This can overwhelm Sonarr, and is difficult to stop once started.")
+        print("\nWARNING: 'Rapid' immediately queues all search queries in parallel. This is difficult to stop once started.")
         if str(input("Are you sure? [Y/N]: ")).lower() == "y":
             rapid_mode = True
 
@@ -61,24 +61,26 @@ def content_redownloader():
                 print("This is not the requested starting show. Skipping...")
                 continue
             starting_series = ""
-            if series['episodeCount'] > int(max_episodes):
+            # In Sonarr v3/v4, episode counts are nested in 'statistics'
+            episode_count = series['statistics']['episodeFileCount']
+            if episode_count > int(max_episodes):
                 print("Show has more episodes than the limit. Skipping...")
                 continue
 
             # Command Sonarr to perform a series search
-            command_search_url = sonarr_url + "/api/command?apikey=" + api_key
+            command_search_url = sonarr_url + "/api/v3/command?apikey=" + api_key
             command_search_parameters = {"name":"SeriesSearch", "seriesId":int(series['id'])}
             command_search_status = 404
             connection_retries = 0
             while command_search_status != 201:
                 try:
-                    command_search_response = requests.post(command_search_url, json.dumps(command_search_parameters))
+                    command_search_response = requests.post(command_search_url, json=command_search_parameters)
                     command_search_status = command_search_response.status_code
                     if command_search_status == 201:
                         break
-                except:
+                except Exception:
                     pass
-                print("Search command failed! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
+                print(f"Search command failed! Retrying in {CONNECTION_RETRY_TIMEOUT} seconds...")
                 connection_retries = connection_retries + 1
                 sleep(CONNECTION_RETRY_TIMEOUT)
                 if connection_retries > MAX_CONNECTION_RETRIES:
@@ -87,7 +89,7 @@ def content_redownloader():
 
             # Wait for the search to complete
             if not rapid_mode:
-                completion_url = sonarr_url + "/api/command/" + str(command_search_id) + "?apikey=" + api_key
+                completion_url = sonarr_url + "/api/v3/command/" + str(command_search_id) + "?apikey=" + api_key
                 timeout_counter = 0
                 while True:
                     sleep(5)
@@ -100,9 +102,9 @@ def content_redownloader():
                             completion_status = completion_response.status_code
                             if completion_status == 200:
                                 break
-                        except:
+                        except Exception:
                             pass
-                        print("Completion check failed! Retrying in " + CONNECTION_RETRY_TIMEOUT + " seconds...")
+                        print(f"Completion check failed! Retrying in {CONNECTION_RETRY_TIMEOUT} seconds...")
                         connection_retries = connection_retries + 1
                         sleep(CONNECTION_RETRY_TIMEOUT)
                         if connection_retries > MAX_CONNECTION_RETRIES:
@@ -110,7 +112,7 @@ def content_redownloader():
                     if json.loads(completion_response.content)['state'] == "completed":
                         break
                     if timeout_counter > MAX_TIMEOUT:
-                        print("Show is still processing after " + str(MAX_TIMEOUT) + " seconds. Starting the next show.")
+                        print(f"Show is still processing after {MAX_TIMEOUT} seconds. Starting the next show.")
                         break
     return True
 
