@@ -355,14 +355,15 @@ class SonarrRedownloader:
         ids_to_process = list(self.state.series_ids)
 
         for series_id in ids_to_process:
+            # Check if the series exists
             series = self._get_series_by_id(series_id)
             if not series:
                 print_warning(
-                    f"Series with ID {series_id} missing from Sonarr. Likely deleted by user. Skipping..."
+                    f"Series with ID {series_id} missing from Sonarr (likely deleted by user). Skipping..."
                 )
                 continue
 
-            # Progress update
+            # Print out progress / status
             percent = (self.state.total_completed / total_series) * 100
             time_estimate_sec = self._time_estimate(
                 initial_session_remaining, initial_session_eps, start_time
@@ -384,13 +385,13 @@ class SonarrRedownloader:
                     break
                 continue
 
-            # Remove from state (search was successfully queued)
+            # Remove from series from list (search was successfully queued)
             if series_id in self.state.series_ids:
                 self.state.series_ids.remove(series_id)
                 self.state.total_completed += 1
                 self.state.save()
 
-            # Wait for completion, unless in rapid mode
+            # Wait for search to complete, unless we are in rapid mode
             if not self.state.rapid_mode and command_id:
                 success = self.client.wait_for_command(command_id, series["title"])
                 if not success:
@@ -399,26 +400,22 @@ class SonarrRedownloader:
                         print_error("Too many failures! Aborting.")
                         break
 
-        # Ask user if they want to retry all failed series
-        self.prompt_retry_failed()
-
         # Done
         elapsed_total = (datetime.now() - start_time).total_seconds()
         msg(
             f"Processed {total_series - len(self.state.series_ids)} series in {humanized_eta(int(elapsed_total))}.",
             type="info",
         )
-        print_success("Completed.")
 
-    def prompt_retry_failed(self):
+    def retry_failures_prompt(self):
         if self.state.series_ids:
             retry_input = input_bold(
-                "Do you want to retry all failed series? [Y/N]: "
+                "Do you want to retry all failed searches? [Y/N]: "
             ).lower()
             if retry_input == "y":
-                print_info("Retrying failed series...")
+                print_info("Retrying failed searches...")
                 self.resume = True
-                self.run()  # Recursive call to retry
+                self.run()
 
 
 if __name__ == "__main__":
@@ -426,7 +423,10 @@ if __name__ == "__main__":
     try:
         app = SonarrRedownloader()
         app.run()
-        if app and app.state:
-            app.state.clear()
+        app.retry_failures_prompt()
+        app.state.clear()
+        print_success("Completed.")
     except KeyboardInterrupt:
         print_error("Script aborted by user.")
+    except Exception as e:
+        print_error(f"An unexpected error occurred: {e}")
