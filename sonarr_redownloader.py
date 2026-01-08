@@ -1,9 +1,16 @@
 import contextlib
 import json
+from concurrent.futures import (
+    ALL_COMPLETED,
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from datetime import datetime
 from pathlib import Path
 from time import sleep
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Set, cast
 
 import requests
 
@@ -86,7 +93,7 @@ class StateManager:
         self.api_key: str = ""
         self.series_ids: List[int] = []
         self.time_estimate: int = 0
-        self.rapid_mode: bool = False
+        self.speed: Literal[0, 1, 2, 3] = 0
         self.total_completed: int = 0
 
     def load(self) -> bool:
@@ -98,7 +105,7 @@ class StateManager:
                     self.api_key = state.get("api_key", "")
                     self.series_ids = state.get("series_ids", [])
                     self.time_estimate = state.get("time_estimate", 0)
-                    self.rapid_mode = state.get("rapid_mode", False)
+                    self.speed = state.get("speed", 1)
                     self.total_completed = state.get("total_completed", 0)
                     if self.series_ids:
                         return True
@@ -111,9 +118,9 @@ class StateManager:
             "sonarr_url": self.sonarr_url,
             "api_key": self.api_key,
             "time_estimate": self.time_estimate,
-            "rapid_mode": self.rapid_mode,
             "total_completed": self.total_completed,
             "series_ids": self.series_ids,
+            "speed": self.speed,
         }
         with open(self.STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -121,7 +128,7 @@ class StateManager:
     def clear(self) -> None:
         self.series_ids = []
         self.time_estimate = 0
-        self.rapid_mode = False
+        self.speed = 1
         self.total_completed = 0
         self.save()
 
@@ -175,25 +182,34 @@ class SonarrClient:
         start_time = datetime.now()
         while True:
             sleep(10)
-            status = self.get_command_status(command_id)
-            if not status:
-                msg(series_title, "Failed to get command status.", type="error")
-                return False  # Failed communication
+            result = self.check_command_completion(command_id, series_title, start_time)
+            if result is not None:
+                return result
 
-            if status in {"failed", "cancelled", "orphaned", "aborted"}:
-                msg(series_title, "Search failed/cancelled.", type="error")
-                return False  # Failed command
+    def check_command_completion(
+        self, command_id: int, series_title: str, start_time: datetime
+    ) -> Optional[bool]:
+        status = self.get_command_status(command_id)
+        if not status:
+            msg(series_title, "Failed to get command status.", type="error")
+            return False  # Failed communication
 
-            if status == "completed":
-                return True  # Success
+        if status in {"failed", "cancelled", "orphaned", "aborted"}:
+            msg(series_title, "Search failed/cancelled.", type="error")
+            return False  # Failed command
 
-            if (datetime.now() - start_time).total_seconds() > MAX_SEARCH_WAIT:
-                msg(
-                    series_title,
-                    f"Took longer than {humanized_eta(MAX_SEARCH_WAIT)} to process. Moving on...",
-                    type="warning",
-                )
-                return True
+        if status == "completed":
+            return True  # Success
+
+        if (datetime.now() - start_time).total_seconds() > MAX_SEARCH_WAIT:
+            msg(
+                series_title,
+                f"Took longer than {humanized_eta(MAX_SEARCH_WAIT)} to process. Moving on...",
+                type="warning",
+            )
+            return True
+
+        return None  # Still running
 
 
 class SonarrRedownloader:
@@ -227,10 +243,9 @@ class SonarrRedownloader:
             print_error(str(e))
             return False
 
-        # 4. Filter if not resuming
-        if not self.resume:
-            self._configure_preferences()
-            self.state.save()
+        # 4. Prompt for user settings / preferences
+        self._configure_preferences()
+        self.state.save()
 
         # 5. Adjust max failures
         if len(self.state.series_ids) > 0:
@@ -244,41 +259,55 @@ class SonarrRedownloader:
         if self.state.api_key:
             print_info("Previous API Key: ***********")
 
-        input_url = input_bold(
+        url = input_bold(
             f"Sonarr URL {self.state.sonarr_url and '[Enter to re-use]'}: "
         )
-        if input_url:
-            self.state.sonarr_url = input_url
+        if url:
+            self.state.sonarr_url = url
 
-        input_key = input_bold(
+        api_key = input_bold(
             f"Sonarr API Key {self.state.api_key and '[Enter to re-use]'}: "
         )
-        if input_key:
-            self.state.api_key = input_key
+        if api_key:
+            self.state.api_key = api_key
 
     def _configure_preferences(self):
-        root_dir = input_bold("Root directory to upgrade (optional): ")
+        if not self.resume:
+            root_dir = input_bold("Root directory to upgrade (optional): ")
+            try:
+                max_episodes = int(
+                    input_bold("Skip shows with greater than X episodes (optional): ")
+                )
+            except ValueError:
+                max_episodes = float("inf")
 
-        try:
-            max_ep_input = input_bold(
-                "Skip shows with greater than X episodes (optional): "
-            )
-            max_episodes = int(max_ep_input)
-        except ValueError:
-            max_episodes = float("inf")
+            self.state.total_completed = 0
+            self.state.series_ids = self._filter_series(root_dir, max_episodes)
 
-        rapid_mode_input = input_bold("Rapid mode [Y/N]? ").lower()
-        if rapid_mode_input == "y":
-            confirm = input_warning(
-                "Rapid mode queues everything at once! This is difficult to stop once started. Are you sure? [Y/N]: "
+        # Always prompt for speed to allow user to cancel script and adjust
+        if self.state.speed != 0:
+            print_info(f"Previous speed '{self.state.speed}' [Enter to re-use]")
+        while True:
+            speed_input = cast(
+                Literal[1, 2, 3],
+                int(
+                    input_bold("Search speed [1-3] (optional): ")
+                    or self.state.speed
+                    or 1
+                ),
             )
-            if confirm.lower() == "y":
-                self.state.rapid_mode = True
+            if speed_input == 3:
+                confirm = input_warning(
+                    "Speed '3' queues everything at once! This is difficult to stop once started, and speed '2' is nearly as fast. Are you sure? [Y/N]: "
+                )
+                if confirm.lower() == "y":
+                    self.state.speed = 3
+                    break
+            elif speed_input in {1, 2}:
+                self.state.speed = speed_input
+                break
             else:
-                print_info("Rapid mode cancelled.")
-
-        self.state.total_completed = 0
-        self.state.series_ids = self._filter_series(root_dir, max_episodes)
+                print_warning("Invalid speed level. Please enter 1, 2, or 3.")
 
     def _filter_series(self, root_dir: str, max_episodes: float) -> List[int]:
         ids = []
@@ -339,66 +368,102 @@ class SonarrRedownloader:
 
         return self.state.time_estimate
 
-    def run(self):
-        if not self.setup():
-            return
+    def _wait_for(self, futures: Set[Future], wait_all: bool = False) -> int:
+        """
+        Waits for futures to complete.
+        If wait_all is False, waits for FIRST_COMPLETED.
+        If wait_all is True, waits for ALL_COMPLETED.
+        Removes completed futures from the set.
+        Returns the number of failures from completed futures.
+        """
+        new_failures = 0
+        if not futures:
+            return 0
 
+        return_when = ALL_COMPLETED if wait_all else FIRST_COMPLETED
+        done, not_done = wait(futures, return_when=return_when)
+
+        for f in done:
+            # wait_for_command returns True/False
+            if not f.result():
+                new_failures += 1
+
+        # Update the set of futures to only contain the pending ones
+        futures.clear()
+        futures.update(not_done)
+
+        return new_failures
+
+    def run(self) -> None:
+        if not self.setup():
+            return  # Setup failed, it should have printed an error
         initial_session_remaining = len(self.state.series_ids)
         total_series = initial_session_remaining + self.state.total_completed
         if initial_session_remaining == 0:
-            print_info("No series to process.")
-            return
-
+            return print_info("No series to process.")
         initial_session_eps = self._calculate_total_episodes(self.state.series_ids)
         start_time = datetime.now()
         failures = 0
         ids_to_process = list(self.state.series_ids)
+        active_futures: Set[Future] = set()
 
-        for series_id in ids_to_process:
-            # Check if the series exists
-            series = self._get_series_by_id(series_id)
-            if not series:
-                print_warning(
-                    f"Series with ID {series_id} missing from Sonarr (likely deleted by user). Skipping..."
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for x, series_id in enumerate(ids_to_process):
+                # Check if the series exists
+                series = self._get_series_by_id(series_id)
+                if not series:
+                    print_warning(
+                        f"Series with ID {series_id} missing from Sonarr (likely deleted by user). Skipping..."
+                    )
+                    continue
+
+                # Print out progress / status
+                percent = (self.state.total_completed / total_series) * 100
+                time_estimate_sec = 0
+                if x > 3:  # Wait a bit before estimating time
+                    time_estimate_sec = self._time_estimate(
+                        initial_session_remaining, initial_session_eps, start_time
+                    )
+                msg(
+                    f"{series['title']}",
+                    f"{self.state.total_completed}/{total_series} ({percent:.2f}%)",
+                    f"{humanized_eta(time_estimate_sec)} remaining (estimated)",
+                    type="success",
                 )
-                continue
 
-            # Print out progress / status
-            percent = (self.state.total_completed / total_series) * 100
-            time_estimate_sec = self._time_estimate(
-                initial_session_remaining, initial_session_eps, start_time
-            )
-            msg(
-                f"{series['title']}",
-                f"{self.state.total_completed}/{total_series} ({percent:.2f}%)",
-                f"{humanized_eta(time_estimate_sec)} remaining (estimated)",
-                type="success",
-            )
-
-            # Search
-            command_id = self.client.search_series(series_id)
-            if not command_id:
-                msg(series["title"], "Search command failed.", type="warning")
-                failures += 1
-                if failures > self.max_failures:
-                    print_error("Too many failures! Aborting.")
-                    break
-                continue
-
-            # Remove from series from list (search was successfully queued)
-            if series_id in self.state.series_ids:
-                self.state.series_ids.remove(series_id)
-                self.state.total_completed += 1
-                self.state.save()
-
-            # Wait for search to complete, unless we are in rapid mode
-            if not self.state.rapid_mode and command_id:
-                success = self.client.wait_for_command(command_id, series["title"])
-                if not success:
+                # Queue a "series search" in Sonarr
+                command_id = self.client.search_series(series_id)
+                if not command_id:
+                    msg(series["title"], "Search command failed.", type="warning")
                     failures += 1
                     if failures > self.max_failures:
                         print_error("Too many failures! Aborting.")
                         break
+                    continue
+
+                # Remove from series from list (search was successfully queued)
+                if series_id in self.state.series_ids:
+                    self.state.series_ids.remove(series_id)
+                    self.state.total_completed += 1
+                    self.state.save()
+
+                # Wait for search to complete, depending on speed setting
+                if self.state.speed == 3:
+                    continue  # All searches queued at once, no waiting here
+                future = executor.submit(
+                    self.client.wait_for_command, command_id, series["title"]
+                )
+                active_futures.add(future)
+                active_limit = 3 if self.state.speed == 2 else 1
+                if len(active_futures) >= active_limit:
+                    failures += self._wait_for(active_futures)
+                if failures > self.max_failures:
+                    print_error("Too many failures! Aborting.")
+                    break
+
+            # All tasks (for speed 1 and 2) have been queued, wait for last batch to complete
+            if failures <= self.max_failures:
+                failures += self._wait_for(active_futures, wait_all=True)
 
         # Done
         elapsed_total = (datetime.now() - start_time).total_seconds()
