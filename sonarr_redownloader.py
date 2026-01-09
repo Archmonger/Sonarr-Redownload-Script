@@ -1,5 +1,6 @@
 import contextlib
 import json
+import sys
 from concurrent.futures import (
     ALL_COMPLETED,
     FIRST_COMPLETED,
@@ -22,20 +23,37 @@ CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
 MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
 
 
+_sticky_text = ""
+
+
+def set_sticky_text(text: str) -> None:
+    global _sticky_text
+    _sticky_text = text
+    sys.stdout.write(f"\r\033[K{text}\r")
+    sys.stdout.flush()
+
+
+def _print_text(text: str = "") -> None:
+    sys.stdout.write(f"\r\033[K{text}\n")
+    if _sticky_text:
+        sys.stdout.write(f"\033[K{_sticky_text}\r")
+    sys.stdout.flush()
+
+
 def print_success(text: str) -> None:
-    print(f"\033[92m{text}\033[0m")
+    _print_text(f"\033[92m{text}\033[0m")
 
 
 def print_info(text: str) -> None:
-    print(f"\033[96m{text}\033[0m")
+    _print_text(f"\033[96m{text}\033[0m")
 
 
 def print_warning(text: str) -> None:
-    print(f"\033[93m{text}\033[0m")
+    _print_text(f"\033[93m{text}\033[0m")
 
 
 def print_error(text: str) -> None:
-    print(f"\033[91m{text}\033[0m")
+    _print_text(f"\033[91m{text}\033[0m")
 
 
 def input_bold(text: str) -> str:
@@ -429,6 +447,11 @@ class SonarrRedownloader:
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             for x, series_id in enumerate(ids_to_process):
+                # Check failure count
+                if failures > self.max_failures:
+                    print_error("Script encountered too many failures! Aborting.")
+                    break
+
                 # Check if the series exists
                 series = self._get_series_by_id(series_id)
                 if not series:
@@ -437,28 +460,32 @@ class SonarrRedownloader:
                     )
                     continue
 
-                # Print out progress / status
+                # Update progress information
                 percent = (self.state.total_completed / total_series) * 100
                 if x > self.state.speed * 2:  # Wait a bit before time estimation
                     self._calculate_time_estimate(
                         initial_session_remaining, initial_session_eps, start_time
                     )
-                msg(
-                    f"{series['title']} (queued)",
-                    f"{self.state.total_completed}/{total_series} ({percent:.2f}%) completed",
-                    f"{failures} failed",
-                    f"{humanized_eta(self.state.time_estimate)} remaining",
-                    type="success",
+                set_sticky_text(
+                    f"\033[92mCompleted: {self.state.total_completed}/{total_series} ({percent:.2f}%)\033[0m  —  "
+                    f"\033[91mFailed: {failures}\033[0m  —  "
+                    f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
                 )
 
                 # Queue a "series search" in Sonarr
+                msg(
+                    f"{series['title']}",
+                    "Sonarr 'Series Search' queued.",
+                    type="success",
+                )
                 command_id = self.client.search_series(series_id)
                 if not command_id:
-                    msg(series["title"], "Sonarr did not respond!", type="error")
+                    msg(
+                        series["title"],
+                        "Sonarr did not respond to 'Series Search'!",
+                        type="error",
+                    )
                     failures += 1
-                    if failures > self.max_failures:
-                        print_error("Too many failures! Aborting.")
-                        break
                     continue
 
                 # Remove from series from list (search was successfully queued)
@@ -469,7 +496,7 @@ class SonarrRedownloader:
 
                 # Wait for search to complete, depending on speed setting
                 if self.state.speed == 3:
-                    continue  # All searches queued at once, no waiting here
+                    continue  # Speed 3: No waiting for task completion
                 future = executor.submit(
                     self.client.wait_for_command, command_id, series["title"]
                 )
@@ -477,19 +504,17 @@ class SonarrRedownloader:
                 active_limit = 2 if self.state.speed == 2 else 1
                 if len(active_futures) >= active_limit:
                     failures += self._wait_for(active_futures)
-                if failures > self.max_failures:
-                    print_error("Too many failures! Aborting.")
-                    break
 
-            # All tasks (for speed 1 and 2) have been queued, wait for last batch to complete
+            # For speed 1 and 2: All tasks are within our internal queue. Wait for the last batch to complete.
             if failures <= self.max_failures:
                 failures += self._wait_for(active_futures, wait_all=True)
 
         # Done
+        set_sticky_text("")
         elapsed_total = (datetime.now() - start_time).total_seconds()
         print_success(
             f"Successfully processed {total_series - len(self.state.series_ids)} show{'s' if total_series - len(self.state.series_ids) != 1 else ''} in {humanized_eta(int(elapsed_total))}. "
-            f"Failed process {failures} show{'s' if failures != 1 else ''}."
+            f"Failed processing {failures} show{'s' if failures != 1 else ''}."
         )
 
     def retry_failures_prompt(self):
