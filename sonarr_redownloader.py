@@ -15,9 +15,10 @@ from typing import Dict, List, Literal, Optional, Set, cast
 import requests
 
 # Constants
-MAX_SEARCH_WAIT = 3600  # Time in seconds
+MAX_SEARCH_WAIT = 5400  # Time in seconds
 MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
+CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
 MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
 
 
@@ -49,7 +50,9 @@ def msg(
     *text: str, type: Literal["info", "success", "warning", "error"] = "info"
 ) -> None:
     """Print a formatted multi-part message to the console."""
+    _timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     _msg = "  —  ".join(text) if isinstance(text, tuple) else text
+    _msg = f"[{_timestamp}] {_msg}"
     if type == "info":
         print_info(_msg)
     elif type == "success":
@@ -180,11 +183,19 @@ class SonarrClient:
 
     def wait_for_command(self, command_id: int, series_title: str) -> bool:
         start_time = datetime.now()
+        first_check = True
         while True:
-            sleep(10)
+            sleep(CHECK_STATUS_INTERVAL)
             result = self.check_command_completion(command_id, series_title, start_time)
             if result is not None:
+                if first_check:
+                    msg(
+                        series_title,
+                        "Search completed suspiciously fast, consider investigating.",
+                        type="warning",
+                    )
                 return result
+            first_check = False
 
     def check_command_completion(
         self, command_id: int, series_title: str, start_time: datetime
@@ -195,7 +206,11 @@ class SonarrClient:
             return False  # Failed communication
 
         if status in {"failed", "cancelled", "orphaned", "aborted"}:
-            msg(series_title, "Search failed/cancelled.", type="error")
+            msg(
+                series_title,
+                "Sonarr attempted to search, but reported the search failed!",
+                type="error",
+            )
             return False  # Failed command
 
         if status == "completed":
@@ -298,7 +313,8 @@ class SonarrRedownloader:
             )
             if speed_input == 3:
                 confirm = input_warning(
-                    "Speed '3' queues everything at once! This is difficult to stop once started, and speed '2' is nearly as fast. Are you sure? [Y/N]: "
+                    "Speed '3' queues everything at once! This is difficult to stop once started, and most indexers will block or rate limit you.\n"
+                    "Are you sure? [Y/N]: "
                 )
                 if confirm.lower() == "y":
                     self.state.speed = 3
@@ -342,12 +358,12 @@ class SonarrRedownloader:
                 count += s["statistics"]["totalEpisodeCount"]
         return count
 
-    def _time_estimate(
+    def _calculate_time_estimate(
         self,
         initial_session_remaining: int,
         initial_session_eps: int,
         session_start_time: datetime,
-    ) -> int:
+    ) -> None:
         # Sometimes, 'SeriesSearch' falls back to searching for individual episodes,
         # so we average several estimates to improve accuracy.
         remaining_searches = len(self.state.series_ids)
@@ -364,9 +380,13 @@ class SonarrRedownloader:
             est_series = (elapsed / session_completed) * remaining_searches
 
             # Set the value within the state storage
-            self.state.time_estimate = int((est_ep + est_series) / 2)
-
-        return self.state.time_estimate
+            # Average with previous estimate for smoothing, if possible
+            new_estimate = int((est_ep + est_series) / 2)
+            self.state.time_estimate = (
+                int((self.state.time_estimate + new_estimate) / 2)
+                if self.state.time_estimate > 0
+                else new_estimate
+            )
 
     def _wait_for(self, futures: Set[Future], wait_all: bool = False) -> int:
         """
@@ -419,22 +439,22 @@ class SonarrRedownloader:
 
                 # Print out progress / status
                 percent = (self.state.total_completed / total_series) * 100
-                time_estimate_sec = 0
-                if x > 3:  # Wait a bit before estimating time
-                    time_estimate_sec = self._time_estimate(
+                if x > self.state.speed * 2:  # Wait a bit before time estimation
+                    self._calculate_time_estimate(
                         initial_session_remaining, initial_session_eps, start_time
                     )
                 msg(
-                    f"{series['title']}",
-                    f"{self.state.total_completed}/{total_series} ({percent:.2f}%)",
-                    f"{humanized_eta(time_estimate_sec)} remaining (estimated)",
+                    f"{series['title']} (queued)",
+                    f"{self.state.total_completed}/{total_series} ({percent:.2f}%) completed",
+                    f"{failures} failed",
+                    f"{humanized_eta(self.state.time_estimate)} remaining",
                     type="success",
                 )
 
                 # Queue a "series search" in Sonarr
                 command_id = self.client.search_series(series_id)
                 if not command_id:
-                    msg(series["title"], "Search command failed.", type="warning")
+                    msg(series["title"], "Sonarr did not respond!", type="error")
                     failures += 1
                     if failures > self.max_failures:
                         print_error("Too many failures! Aborting.")
@@ -454,7 +474,7 @@ class SonarrRedownloader:
                     self.client.wait_for_command, command_id, series["title"]
                 )
                 active_futures.add(future)
-                active_limit = 3 if self.state.speed == 2 else 1
+                active_limit = 2 if self.state.speed == 2 else 1
                 if len(active_futures) >= active_limit:
                     failures += self._wait_for(active_futures)
                 if failures > self.max_failures:
@@ -467,9 +487,9 @@ class SonarrRedownloader:
 
         # Done
         elapsed_total = (datetime.now() - start_time).total_seconds()
-        msg(
-            f"Processed {total_series - len(self.state.series_ids)} series in {humanized_eta(int(elapsed_total))}.",
-            type="info",
+        print_success(
+            f"Successfully processed {total_series - len(self.state.series_ids)} show{'s' if total_series - len(self.state.series_ids) != 1 else ''} in {humanized_eta(int(elapsed_total))}. "
+            f"Failed process {failures} show{'s' if failures != 1 else ''}."
         )
 
     def retry_failures_prompt(self):
@@ -490,7 +510,6 @@ if __name__ == "__main__":
         app.run()
         app.retry_failures_prompt()
         app.state.clear()
-        print_success("Completed.")
     except KeyboardInterrupt:
         print_error("Script aborted by user.")
     except Exception as e:
