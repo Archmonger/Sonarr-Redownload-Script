@@ -30,6 +30,12 @@ _sticky_text = ""
 def set_sticky_text(text: str) -> None:
     global _sticky_text
     _sticky_text = text
+
+    if not text:
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+        return
+
     sys.stdout.write(f"\r\033[K{text}\r")
     sys.stdout.flush()
 
@@ -430,36 +436,35 @@ class SonarrRedownloader:
                 else new_estimate
             )
 
-    def _wait_for_task(self, futures: Set[Future]) -> int:
+    def _check_failure(self, futures: Set[Future]) -> int:
         """
-        Waits for futures to complete.
-        Removes completed futures from the set.
-        Returns the number of failures from completed futures.
+        Waits for a 'future' (series search) to complete.
+        On failure: re-add failed series to the pending list (may have been optimistically removed earlier).
+        On success: adds to total_completed.
+        Returns the number of failures that occurred.
         """
-        new_failures = 0
         if not futures:
             return 0
 
-        done, not_done = wait(futures, return_when=FIRST_COMPLETED)
-
+        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+        failures = 0
         for f in done:
-            result, series_id = f.result()
-
-            # Re-add failed series to the pending list (may have been optimistically removed earlier)
-            if result is False:
-                if series_id not in self.state.incompleted_ids:
-                    self.state.incompleted_ids.append(series_id)
-                    self.state.save()
-
-            # Count failures
-            if not result:
-                new_failures += 1
-
-        # Update the set of futures to only contain the pending ones
-        futures.clear()
-        futures.update(not_done)
-
-        return new_failures
+            futures.remove(f)
+            try:
+                success, series_id = f.result()
+                if not success:
+                    failures += 1
+                    if series_id not in self.state.incompleted_ids:
+                        self.state.incompleted_ids.append(series_id)
+                else:
+                    self.state.total_completed += 1
+            except Exception as e:
+                failures += 1
+                print_error(
+                    f"An unexpected error occurred while processing a series: {e}"
+                )
+        self.state.save()
+        return failures
 
     def retry_failures_prompt(self):
         if self.state.incompleted_ids:
@@ -502,14 +507,15 @@ class SonarrRedownloader:
                     continue
 
                 # Update progress information
-                percent = (self.state.total_completed / total_series) * 100
+                percent = ((self.state.total_completed + failures) / total_series) * 100
                 if x > self.state.speed * 2:  # Wait a bit before time estimation
                     self._calculate_time_estimate(
                         initial_session_remaining, initial_session_eps, start_time
                     )
                 set_sticky_text(
-                    f"\033[92mCompleted: {self.state.total_completed}/{total_series} ({percent:.2f}%)\033[0m  —  "
+                    f"\033[92mCompleted: {self.state.total_completed}\033[0m  —  "
                     f"\033[91mFailed: {failures}\033[0m  —  "
+                    f"\033[93mTotal: {self.state.total_completed + failures}/{total_series} ({percent:.2f}%)\033[0m  —  "
                     f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
                 )
 
@@ -544,13 +550,13 @@ class SonarrRedownloader:
                 self.active_futures.add(future)
                 active_limit = 2 if self.state.speed == 2 else 1
                 if len(self.active_futures) >= active_limit:
-                    failures += self._wait_for_task(self.active_futures)
+                    failures += self._check_failure(self.active_futures)
 
             # For speed 1 and 2: All tasks are within our internal queue. Wait for the last batch to complete.
             while self.active_futures and failures <= self.max_failures:
                 if STOP_EVENT.is_set():
                     break
-                failures += self._wait_for_task(self.active_futures)
+                failures += self._check_failure(self.active_futures)
 
         # Done
         set_sticky_text("")
