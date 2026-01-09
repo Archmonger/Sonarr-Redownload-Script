@@ -1,6 +1,7 @@
 import contextlib
 import json
 import sys
+import threading
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -9,7 +10,6 @@ from concurrent.futures import (
 )
 from datetime import datetime
 from pathlib import Path
-from time import sleep
 from typing import Dict, List, Literal, Optional, Set, cast
 
 import requests
@@ -20,6 +20,8 @@ MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
 CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
 MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
+
+STOP_EVENT = threading.Event()
 
 
 _sticky_text = ""
@@ -105,13 +107,28 @@ def http_success(status_code: int) -> bool:
     return 200 <= status_code < 300
 
 
+def handle_user_interrupts(func):
+    def wrapper(self: "SonarrRedownloader", *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except KeyboardInterrupt:
+            STOP_EVENT.set()
+            print_warning("\nWaiting for background tasks to cleanup...")
+            for f in self.active_futures:
+                with contextlib.suppress(Exception):
+                    f.result(timeout=10)
+            raise
+
+    return wrapper
+
+
 class StateManager:
     STATE_FILE = Path("downloader_state.json")
 
     def __init__(self):
         self.sonarr_url: str = ""
         self.api_key: str = ""
-        self.uncompleted_ids: List[int] = []
+        self.incompleted_ids: List[int] = []
         self.time_estimate: int = 0
         self.speed: Literal[0, 1, 2, 3] = 0
         self.total_completed: int = 0
@@ -123,11 +140,11 @@ class StateManager:
                     state = json.load(f)
                     self.sonarr_url = state.get("sonarr_url", "")
                     self.api_key = state.get("api_key", "")
-                    self.uncompleted_ids = state.get("uncompleted_ids", [])
+                    self.incompleted_ids = state.get("incompleted_ids", [])
                     self.time_estimate = state.get("time_estimate", 0)
                     self.speed = state.get("speed", 1)
                     self.total_completed = state.get("total_completed", 0)
-                    if self.uncompleted_ids:
+                    if self.incompleted_ids:
                         return True
             except json.JSONDecodeError:
                 print_error("State file corrupted.")
@@ -139,14 +156,14 @@ class StateManager:
             "api_key": self.api_key,
             "time_estimate": self.time_estimate,
             "total_completed": self.total_completed,
-            "uncompleted_ids": self.uncompleted_ids,
+            "incompleted_ids": self.incompleted_ids,
             "speed": self.speed,
         }
         with open(self.STATE_FILE, "w") as f:
             json.dump(state, f)
 
     def clear(self) -> None:
-        self.uncompleted_ids = []
+        self.incompleted_ids = []
         self.time_estimate = 0
         self.speed = 1
         self.total_completed = 0
@@ -179,7 +196,8 @@ class SonarrClient:
             print_warning(
                 f"Connection to Sonarr failed. Retrying in {humanized_eta(delay)}..."
             )
-            sleep(delay)
+            if STOP_EVENT.wait(delay):
+                return None
         return None
 
     def get_all_series(self) -> List[Dict]:
@@ -203,8 +221,9 @@ class SonarrClient:
     ) -> tuple[bool, int]:
         start_time = datetime.now()
         first_check = True
-        while True:
-            sleep(CHECK_STATUS_INTERVAL)
+        while not STOP_EVENT.is_set():
+            if STOP_EVENT.wait(CHECK_STATUS_INTERVAL):
+                return False, series_id
             result = self.check_search_completion(command_id, series_title, start_time)
             if result and first_check:
                 msg(
@@ -215,6 +234,7 @@ class SonarrClient:
             if result is not None:
                 return result, series_id
             first_check = False
+        return False, series_id
 
     def check_search_completion(
         self, command_id: int, series_title: str, start_time: datetime
@@ -253,6 +273,7 @@ class SonarrRedownloader:
         self.resume = False
         self.all_series = []
         self.max_failures = 0
+        self.active_futures: Set[Future] = set()
 
     def setup(self):
         # 1. Load state
@@ -282,9 +303,9 @@ class SonarrRedownloader:
         self.state.save()
 
         # 5. Adjust max failures
-        if len(self.state.uncompleted_ids) > 0:
+        if len(self.state.incompleted_ids) > 0:
             self.max_failures = round(
-                len(self.state.uncompleted_ids) * MAX_FAILURE_RATIO
+                len(self.state.incompleted_ids) * MAX_FAILURE_RATIO
             )
 
         return True
@@ -318,7 +339,7 @@ class SonarrRedownloader:
                 max_episodes = float("inf")
 
             self.state.total_completed = 0
-            self.state.uncompleted_ids = self._filter_series(root_dir, max_episodes)
+            self.state.incompleted_ids = self._filter_series(root_dir, max_episodes)
 
         # Always prompt for speed to allow user to cancel script and adjust
         if self.state.speed != 0:
@@ -387,9 +408,9 @@ class SonarrRedownloader:
     ) -> None:
         # Sometimes, 'SeriesSearch' falls back to searching for individual episodes,
         # so we average several estimates to improve accuracy.
-        remaining_searches = len(self.state.uncompleted_ids)
+        remaining_searches = len(self.state.incompleted_ids)
         if remaining_searches < initial_session_remaining:
-            remaining_eps = self._calculate_total_episodes(self.state.uncompleted_ids)
+            remaining_eps = self._calculate_total_episodes(self.state.incompleted_ids)
             elapsed = (datetime.now() - session_start_time).total_seconds()
 
             # Based on remaining episodes count
@@ -426,8 +447,8 @@ class SonarrRedownloader:
 
             # Re-add failed series to the pending list (may have been optimistically removed earlier)
             if result is False:
-                if series_id not in self.state.uncompleted_ids:
-                    self.state.uncompleted_ids.append(series_id)
+                if series_id not in self.state.incompleted_ids:
+                    self.state.incompleted_ids.append(series_id)
                     self.state.save()
 
             # Count failures
@@ -440,21 +461,34 @@ class SonarrRedownloader:
 
         return new_failures
 
+    def retry_failures_prompt(self):
+        if self.state.incompleted_ids:
+            retry_input = input_bold(
+                "Do you want to retry all failed searches? [Y/N]: "
+            ).lower()
+            if retry_input == "y":
+                print_info("Retrying failed searches...")
+                self.resume = True
+                self.run()
+
+    @handle_user_interrupts
     def run(self) -> None:
         if not self.setup():
             return  # Setup failed, it should have printed an error
-        initial_session_remaining = len(self.state.uncompleted_ids)
+        initial_session_remaining = len(self.state.incompleted_ids)
         total_series = initial_session_remaining + self.state.total_completed
         if initial_session_remaining == 0:
             return print_info("No series to process.")
-        initial_session_eps = self._calculate_total_episodes(self.state.uncompleted_ids)
+        initial_session_eps = self._calculate_total_episodes(self.state.incompleted_ids)
         start_time = datetime.now()
         failures = 0
-        active_futures: Set[Future] = set()
+        self.active_futures = set()
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            for x, series_id in enumerate(self.state.uncompleted_ids.copy()):
-                # Check failure count
+            for x, series_id in enumerate(self.state.incompleted_ids.copy()):
+                # Check for abort conditions
+                if STOP_EVENT.is_set():
+                    break
                 if failures > self.max_failures:
                     print_error("Script encountered too many failures! Aborting.")
                     break
@@ -482,7 +516,7 @@ class SonarrRedownloader:
                 # Queue a "series search" in Sonarr
                 msg(
                     f"{series['title']}",
-                    "Sonarr 'Series Search' queued.",
+                    "Queuing...",
                     type="success",
                 )
                 command_id = self.client.search_series(series_id)
@@ -497,9 +531,8 @@ class SonarrRedownloader:
 
                 # Sonarr successfully received the search request. Optimistically remove it
                 # from our pending list in case the user terminates the script here.
-                if series_id in self.state.uncompleted_ids:
-                    self.state.uncompleted_ids.remove(series_id)
-                    self.state.total_completed += 1
+                if series_id in self.state.incompleted_ids:
+                    self.state.incompleted_ids.remove(series_id)
                     self.state.save()
 
                 # Wait for search to complete, depending on speed setting
@@ -508,32 +541,24 @@ class SonarrRedownloader:
                 future = executor.submit(
                     self.client.wait_for_search, command_id, series["title"], series_id
                 )
-                active_futures.add(future)
+                self.active_futures.add(future)
                 active_limit = 2 if self.state.speed == 2 else 1
-                if len(active_futures) >= active_limit:
-                    failures += self._wait_for_task(active_futures)
+                if len(self.active_futures) >= active_limit:
+                    failures += self._wait_for_task(self.active_futures)
 
             # For speed 1 and 2: All tasks are within our internal queue. Wait for the last batch to complete.
-            while active_futures and failures <= self.max_failures:
-                failures += self._wait_for_task(active_futures)
+            while self.active_futures and failures <= self.max_failures:
+                if STOP_EVENT.is_set():
+                    break
+                failures += self._wait_for_task(self.active_futures)
 
         # Done
         set_sticky_text("")
         elapsed_total = (datetime.now() - start_time).total_seconds()
         print_success(
-            f"Successfully processed {total_series - len(self.state.uncompleted_ids)} show{'s' if total_series - len(self.state.uncompleted_ids) != 1 else ''} in {humanized_eta(int(elapsed_total))}. "
+            f"Successfully processed {total_series - len(self.state.incompleted_ids)} show{'s' if total_series - len(self.state.incompleted_ids) != 1 else ''} in {humanized_eta(int(elapsed_total))}. "
             f"Failed processing {failures} show{'s' if failures != 1 else ''}."
         )
-
-    def retry_failures_prompt(self):
-        if self.state.uncompleted_ids:
-            retry_input = input_bold(
-                "Do you want to retry all failed searches? [Y/N]: "
-            ).lower()
-            if retry_input == "y":
-                print_info("Retrying failed searches...")
-                self.resume = True
-                self.run()
 
 
 if __name__ == "__main__":
