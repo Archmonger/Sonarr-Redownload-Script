@@ -8,7 +8,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Set, cast
 
@@ -20,30 +20,29 @@ MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
 CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
 MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
-
 STOP_EVENT = threading.Event()
-
-
-_sticky_text = ""
+STICKY_TEXT = ""
 
 
 def set_sticky_text(text: str) -> None:
-    global _sticky_text
-    _sticky_text = text
-
-    if not text:
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
-        return
-
+    global STICKY_TEXT
+    STICKY_TEXT = text
     sys.stdout.write(f"\r\033[K{text}\r")
     sys.stdout.flush()
 
 
+def end_sticky_text() -> None:
+    global STICKY_TEXT
+    if STICKY_TEXT:
+        sys.stdout.write(f"\r\033[K{STICKY_TEXT}\n")
+        sys.stdout.flush()
+        STICKY_TEXT = ""
+
+
 def _print_text(text: str = "") -> None:
     sys.stdout.write(f"\r\033[K{text}\n")
-    if _sticky_text:
-        sys.stdout.write(f"\033[K{_sticky_text}\r")
+    if STICKY_TEXT:
+        sys.stdout.write(f"\033[K{STICKY_TEXT}\r")
     sys.stdout.flush()
 
 
@@ -119,10 +118,17 @@ def handle_user_interrupts(func):
             return func(self, *args, **kwargs)
         except KeyboardInterrupt:
             STOP_EVENT.set()
+            end_sticky_text()
             print_warning("\nWaiting for background tasks to cleanup...")
             for f in self.active_futures:
                 with contextlib.suppress(Exception):
                     f.result(timeout=10)
+                with contextlib.suppress(Exception):
+                    # The series were optimistically removed from the pending list earlier.
+                    # Since they've made it into Sonarr's queue, we will continue being
+                    # optimistic and count them as completed.
+                    self.state.completed += 1
+                    self.state.save()
             raise
 
     return wrapper
@@ -134,10 +140,10 @@ class StateManager:
     def __init__(self):
         self.sonarr_url: str = ""
         self.api_key: str = ""
-        self.incompleted_ids: List[int] = []
         self.time_estimate: int = 0
+        self.completed: int = 0
         self.speed: Literal[0, 1, 2, 3] = 0
-        self.total_completed: int = 0
+        self.queue: List[int] = []
 
     def load(self) -> bool:
         if self.STATE_FILE.is_file():
@@ -146,11 +152,11 @@ class StateManager:
                     state = json.load(f)
                     self.sonarr_url = state.get("sonarr_url", "")
                     self.api_key = state.get("api_key", "")
-                    self.incompleted_ids = state.get("incompleted_ids", [])
                     self.time_estimate = state.get("time_estimate", 0)
+                    self.completed = state.get("completed", 0)
                     self.speed = state.get("speed", 1)
-                    self.total_completed = state.get("total_completed", 0)
-                    if self.incompleted_ids:
+                    self.queue = state.get("queue", [])
+                    if self.queue:
                         return True
             except json.JSONDecodeError:
                 print_error("State file corrupted.")
@@ -161,18 +167,17 @@ class StateManager:
             "sonarr_url": self.sonarr_url,
             "api_key": self.api_key,
             "time_estimate": self.time_estimate,
-            "total_completed": self.total_completed,
-            "incompleted_ids": self.incompleted_ids,
+            "completed": self.completed,
             "speed": self.speed,
+            "queue": self.queue,
         }
         with open(self.STATE_FILE, "w") as f:
             json.dump(state, f)
 
-    def clear(self) -> None:
-        self.incompleted_ids = []
+    def reset(self) -> None:
         self.time_estimate = 0
-        self.speed = 1
-        self.total_completed = 0
+        self.completed = 0
+        self.queue = []
         self.save()
 
 
@@ -218,10 +223,6 @@ class SonarrClient:
         response = self._request("POST", "/command", json=payload)
         return response.json().get("id") if response else None
 
-    def search_status(self, command_id: int) -> Optional[str]:
-        response = self._request("GET", f"/command/{command_id}")
-        return response.json().get("status") if response else None
-
     def wait_for_search(
         self, command_id: int, series_title: str, series_id: int
     ) -> tuple[bool, int]:
@@ -245,7 +246,22 @@ class SonarrClient:
     def check_search_completion(
         self, command_id: int, series_title: str, start_time: datetime
     ) -> Optional[bool]:
-        status = self.search_status(command_id)
+        response = self._request("GET", f"/command/{command_id}")
+        result = response.json() if response else {}
+        status = result.get("status") if response else None
+        duration_str = result.get("duration")
+        duration = 0
+        if duration_str:
+            h, m, s = duration_str.split(":")
+            duration = int(
+                timedelta(
+                    hours=int(h),
+                    minutes=int(m),
+                    seconds=float(s),
+                ).total_seconds()
+            )
+        humanized_duration = humanized_eta(duration) if duration else "UNKNOWN"
+
         if not status:
             msg(series_title, "Failed to get command status.", type="error")
             return False  # Failed communication
@@ -253,12 +269,17 @@ class SonarrClient:
         if status in {"failed", "cancelled", "orphaned", "aborted"}:
             msg(
                 series_title,
-                "Sonarr attempted to search, but reported the search failed!",
+                f"Sonarr reported the search has been {status}!",
                 type="error",
             )
             return False  # Failed command
 
         if status == "completed":
+            msg(
+                series_title,
+                f"Search completed in {humanized_duration}.",
+                type="success",
+            )
             return True  # Success
 
         if (datetime.now() - start_time).total_seconds() > MAX_SEARCH_WAIT:
@@ -309,14 +330,13 @@ class SonarrRedownloader:
         self.state.save()
 
         # 5. Adjust max failures
-        if len(self.state.incompleted_ids) > 0:
-            self.max_failures = round(
-                len(self.state.incompleted_ids) * MAX_FAILURE_RATIO
-            )
+        if len(self.state.queue) > 0:
+            self.max_failures = round(len(self.state.queue) * MAX_FAILURE_RATIO)
 
         return True
 
     def _configure_connection(self):
+        self.state.reset()
         if self.state.sonarr_url:
             print_info(f"Previous URL: {self.state.sonarr_url}")
         if self.state.api_key:
@@ -344,8 +364,8 @@ class SonarrRedownloader:
             except ValueError:
                 max_episodes = float("inf")
 
-            self.state.total_completed = 0
-            self.state.incompleted_ids = self._filter_series(root_dir, max_episodes)
+            self.state.completed = 0
+            self.state.queue = self._filter_series(root_dir, max_episodes)
 
         # Always prompt for speed to allow user to cancel script and adjust
         if self.state.speed != 0:
@@ -414,9 +434,9 @@ class SonarrRedownloader:
     ) -> None:
         # Sometimes, 'SeriesSearch' falls back to searching for individual episodes,
         # so we average several estimates to improve accuracy.
-        remaining_searches = len(self.state.incompleted_ids)
+        remaining_searches = len(self.state.queue)
         if remaining_searches < initial_session_remaining:
-            remaining_eps = self._calculate_total_episodes(self.state.incompleted_ids)
+            remaining_eps = self._calculate_total_episodes(self.state.queue)
             elapsed = (datetime.now() - session_start_time).total_seconds()
 
             # Based on remaining episodes count
@@ -440,7 +460,7 @@ class SonarrRedownloader:
         """
         Waits for a 'future' (series search) to complete.
         On failure: re-add failed series to the pending list (may have been optimistically removed earlier).
-        On success: adds to total_completed.
+        On success: adds to completed.
         Returns the number of failures that occurred.
         """
         if not futures:
@@ -454,10 +474,10 @@ class SonarrRedownloader:
                 success, series_id = f.result()
                 if not success:
                     failures += 1
-                    if series_id not in self.state.incompleted_ids:
-                        self.state.incompleted_ids.append(series_id)
+                    if series_id not in self.state.queue:
+                        self.state.queue.append(series_id)
                 else:
-                    self.state.total_completed += 1
+                    self.state.completed += 1
             except Exception as e:
                 failures += 1
                 print_error(
@@ -467,7 +487,7 @@ class SonarrRedownloader:
         return failures
 
     def retry_failures_prompt(self):
-        if self.state.incompleted_ids:
+        if self.state.queue:
             retry_input = input_bold(
                 "Do you want to retry all failed searches? [Y/N]: "
             ).lower()
@@ -480,17 +500,17 @@ class SonarrRedownloader:
     def run(self) -> None:
         if not self.setup():
             return  # Setup failed, it should have printed an error
-        initial_session_remaining = len(self.state.incompleted_ids)
-        total_series = initial_session_remaining + self.state.total_completed
+        initial_session_remaining = len(self.state.queue)
         if initial_session_remaining == 0:
             return print_info("No series to process.")
-        initial_session_eps = self._calculate_total_episodes(self.state.incompleted_ids)
+        total_series = initial_session_remaining + self.state.completed
+        initial_session_eps = self._calculate_total_episodes(self.state.queue)
         start_time = datetime.now()
         failures = 0
         self.active_futures = set()
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            for x, series_id in enumerate(self.state.incompleted_ids.copy()):
+            for x, series_id in enumerate(self.state.queue.copy()):
                 # Check for abort conditions
                 if STOP_EVENT.is_set():
                     break
@@ -507,38 +527,35 @@ class SonarrRedownloader:
                     continue
 
                 # Update progress information
-                percent = ((self.state.total_completed + failures) / total_series) * 100
+                percent = ((self.state.completed + failures) / total_series) * 100
                 if x > self.state.speed * 2:  # Wait a bit before time estimation
                     self._calculate_time_estimate(
                         initial_session_remaining, initial_session_eps, start_time
                     )
                 set_sticky_text(
-                    f"\033[92mCompleted: {self.state.total_completed}\033[0m  —  "
+                    f"\033[92mCompleted: {self.state.completed}\033[0m  —  "
                     f"\033[91mFailed: {failures}\033[0m  —  "
-                    f"\033[93mTotal: {self.state.total_completed + failures}/{total_series} ({percent:.2f}%)\033[0m  —  "
+                    f"\033[93mTotal: {self.state.completed + failures}/{total_series} ({percent:.2f}%)\033[0m  —  "
                     f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
                 )
 
-                # Queue a "series search" in Sonarr
-                msg(
-                    f"{series['title']}",
-                    "Queuing...",
-                    type="success",
-                )
+                # Send a "series search" command to Sonarr
                 command_id = self.client.search_series(series_id)
                 if not command_id:
                     msg(
                         series["title"],
-                        "Sonarr did not respond to 'Series Search'!",
+                        "Sonarr did not respond to 'Series Search' command!",
                         type="error",
                     )
                     failures += 1
                     continue
+                else:
+                    msg(f"{series['title']}", "Search started.", type="info")
 
                 # Sonarr successfully received the search request. Optimistically remove it
-                # from our pending list in case the user terminates the script here.
-                if series_id in self.state.incompleted_ids:
-                    self.state.incompleted_ids.remove(series_id)
+                # from our pending list in case the user terminates the script.
+                if series_id in self.state.queue:
+                    self.state.queue.remove(series_id)
                     self.state.save()
 
                 # Wait for search to complete, depending on speed setting
@@ -559,11 +576,12 @@ class SonarrRedownloader:
                 failures += self._check_failure(self.active_futures)
 
         # Done
-        set_sticky_text("")
+        end_sticky_text()
         elapsed_total = (datetime.now() - start_time).total_seconds()
         print_success(
-            f"Successfully processed {total_series - len(self.state.incompleted_ids)} show{'s' if total_series - len(self.state.incompleted_ids) != 1 else ''} in {humanized_eta(int(elapsed_total))}. "
-            f"Failed processing {failures} show{'s' if failures != 1 else ''}."
+            f"Successfully processed {total_series - len(self.state.queue)} show{'s' if total_series - len(self.state.queue) != 1 else ''} in {humanized_eta(int(elapsed_total))}.\n"
+            f"Failed processing {failures} show{'s' if failures != 1 else ''}.\n"
+            f"Skipped {len(self.state.queue)} show{'s' if len(self.state.queue) != 1 else ''}."
         )
 
 
@@ -574,6 +592,8 @@ if __name__ == "__main__":
         app.run()
         app.retry_failures_prompt()
     except KeyboardInterrupt:
+        end_sticky_text()
         print_error("Script aborted by user.")
     except Exception as e:
+        end_sticky_text()
         print_error(f"An unexpected error occurred: {e}")
