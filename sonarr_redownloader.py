@@ -1,5 +1,6 @@
 import contextlib
 import json
+import logging
 import sys
 import threading
 from concurrent.futures import (
@@ -9,12 +10,24 @@ from concurrent.futures import (
     wait,
 )
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Set, cast
 
 import requests
 
-# Constants
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        RotatingFileHandler(
+            "redownloader.log", maxBytes=50 * 1024 * 1024, backupCount=3
+        )
+    ],
+)
+
+# Globals
 MAX_SEARCH_WAIT = 5400  # Time in seconds
 MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
@@ -47,18 +60,22 @@ def _print_text(text: str = "") -> None:
 
 
 def print_success(text: str) -> None:
+    logging.info(text)
     _print_text(f"\033[92m{text}\033[0m")
 
 
 def print_info(text: str) -> None:
+    logging.info(text)
     _print_text(f"\033[96m{text}\033[0m")
 
 
 def print_warning(text: str) -> None:
+    logging.warning(text)
     _print_text(f"\033[93m{text}\033[0m")
 
 
 def print_error(text: str) -> None:
+    logging.error(text)
     _print_text(f"\033[91m{text}\033[0m")
 
 
@@ -135,7 +152,7 @@ def handle_user_interrupts(func):
 
 
 class StateManager:
-    STATE_FILE = Path("downloader_state.json")
+    STATE_FILE = Path("redownloader_state.json")
 
     def __init__(self):
         self.sonarr_url: str = ""
