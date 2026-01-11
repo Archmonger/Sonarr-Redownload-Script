@@ -244,20 +244,18 @@ class SonarrClient:
         self, command_id: int, series_title: str, series_id: int
     ) -> tuple[bool, int]:
         start_time = datetime.now()
-        first_check = True
         while not STOP_EVENT.is_set():
             if STOP_EVENT.wait(CHECK_STATUS_INTERVAL):
                 return False, series_id
             result = self.check_search_completion(command_id, series_title, start_time)
-            if result and first_check:
+            if result and (datetime.now() - start_time).total_seconds() < 30:
                 msg(
                     series_title,
-                    "Search completed suspiciously fast. Consider investigating this series and/or your indexer(s).",
+                    "Search finished suspiciously fast... Consider investigating this series and/or your indexer(s).",
                     type="warning",
                 )
             if result is not None:
                 return result, series_id
-            first_check = False
         return False, series_id
 
     def check_search_completion(
