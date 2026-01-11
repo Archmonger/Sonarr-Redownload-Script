@@ -246,7 +246,8 @@ class SonarrClient:
         start_time = datetime.now()
         while not STOP_EVENT.is_set():
             if STOP_EVENT.wait(CHECK_STATUS_INTERVAL):
-                return False, series_id
+                # User requested stop; optimistically believe the ongoing search will be successful
+                return True, series_id 
             result = self.check_search_completion(command_id, series_title, start_time)
             if result and (datetime.now() - start_time).total_seconds() < 30:
                 msg(
