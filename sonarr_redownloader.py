@@ -39,9 +39,11 @@ STICKY_TEXT = ""
 
 def set_sticky_text(text: str) -> None:
     global STICKY_TEXT
-    STICKY_TEXT = text
-    if text and text != STICKY_TEXT:
+    if not text:
+        return
+    if text != STICKY_TEXT:
         _log(text, logging.INFO)
+    STICKY_TEXT = text
     sys.stdout.write(f"\r\033[K{text}\r")
     sys.stdout.flush()
 
@@ -60,11 +62,13 @@ def _print_text(text: str = "") -> None:
         sys.stdout.write(f"\033[K{STICKY_TEXT}\r")
     sys.stdout.flush()
 
-def _log(text: str, level:int) -> None:
+
+def _log(text: str, level: int) -> None:
     # Remove pre-inserted dates from text
     if text.startswith("[") and "]" in text:
         text = text.split("] ", 1)[1]
     logging.log(level, text.encode("utf-8", errors="replace").decode())
+
 
 def print_success(text: str) -> None:
     _log(text, logging.INFO)
@@ -168,6 +172,7 @@ class StateManager:
         self.completed: int = 0
         self.speed: Literal[0, 1, 2, 3] = 0
         self.suspicious: Set[int] = set()
+        self.failures: Set[int] = set()
         self.queue: Set[int] = set()
 
     def load(self) -> bool:
@@ -181,8 +186,9 @@ class StateManager:
                     self.completed = state.get("completed", 0)
                     self.speed = state.get("speed", 1)
                     self.suspicious = set(state.get("suspicious", []))
+                    self.failures = set(state.get("failures", []))
                     self.queue = set(state.get("queue", []))
-                    if self.queue:
+                    if self.queue or self.failures:
                         return True
             except json.JSONDecodeError:
                 print_error("State file corrupted.")
@@ -196,6 +202,7 @@ class StateManager:
             "completed": self.completed,
             "speed": self.speed,
             "suspicious": list(self.suspicious),
+            "failures": list(self.failures),
             "queue": list(self.queue),
         }
         with open(self.STATE_FILE, "w") as f:
@@ -205,6 +212,7 @@ class StateManager:
         self.time_estimate = 0
         self.completed = 0
         self.queue = set()
+        self.failures = set()
         self.save()
 
 
@@ -392,6 +400,7 @@ class SonarrRedownloader:
                 max_episodes = float("inf")
 
             self.state.completed = 0
+            self.state.failures = set()
             self.state.queue = set(self._filter_series(root_dir, max_episodes))
 
         # Always prompt for speed to allow user to cancel script and adjust
@@ -454,24 +463,21 @@ class SonarrRedownloader:
         return count
 
     def _calculate_time_estimate(
-        self,
-        initial_session_remaining: int,
-        initial_session_eps: int,
-        session_start_time: datetime,
+        self, queue_length: int, episode_count: int, start_time: datetime
     ) -> None:
         # Sometimes, 'SeriesSearch' falls back to searching for individual episodes,
         # so we average several estimates to improve accuracy.
         remaining_searches = len(self.state.queue)
-        if remaining_searches < initial_session_remaining:
+        if remaining_searches < queue_length:
             remaining_eps = self._calculate_total_episodes(self.state.queue)
-            elapsed = (datetime.now() - session_start_time).total_seconds()
+            elapsed = (datetime.now() - start_time).total_seconds()
 
             # Based on remaining episodes count
-            eps_completed = initial_session_eps - remaining_eps + 1
+            eps_completed = episode_count - remaining_eps + 1
             est_ep = (elapsed / eps_completed) * remaining_eps
 
             # Based on remaining series count
-            session_completed = initial_session_remaining - remaining_searches + 1
+            session_completed = queue_length - remaining_searches + 1
             est_series = (elapsed / session_completed) * remaining_searches
 
             # Set the value within the state storage
@@ -500,11 +506,11 @@ class SonarrRedownloader:
             try:
                 success, series_id, suspicious = f.result()
                 if suspicious:
-                     self.state.suspicious.add(series_id)
+                    self.state.suspicious.add(series_id)
 
                 if not success:
                     failures += 1
-                    self.state.queue.add(series_id)
+                    self.state.failures.add(series_id)
                 else:
                     self.state.completed += 1
             except Exception as e:
@@ -516,12 +522,14 @@ class SonarrRedownloader:
         return failures
 
     def retry_failures_prompt(self):
-        if self.state.queue:
+        if self.state.failures:
             retry_input = input_bold(
                 "Do you want to retry all failed searches? [Y/N]: "
             ).lower()
             if retry_input == "y":
                 print_info("Retrying failed searches...")
+                self.state.queue.update(self.state.failures)
+                self.state.failures = set()
                 self.resume = True
                 self.run()
 
@@ -537,25 +545,46 @@ class SonarrRedownloader:
                 self.resume = True
                 self.run()
 
+    def update_status(
+        self,
+        initial_queue_length: int,
+        initial_episode_count: int,
+        queue_position: int,
+        current_failures: int,
+        start_time: datetime,
+    ) -> None:
+        total_failures = len(self.state.failures) + current_failures 
+        total_queued = len(self.state.queue) + len(self.state.failures) + self.state.completed
+        percent = ((self.state.completed + total_failures) / total_queued) * 100
+        if queue_position > self.state.speed * 2:  # Wait a bit before time estimation
+            self._calculate_time_estimate(
+                initial_queue_length, initial_episode_count, start_time
+            )
+        set_sticky_text(
+            f"\033[92mCompleted: {self.state.completed}\033[0m  —  "
+            f"\033[91mFailed: {total_failures}\033[0m  —  "
+            f"\033[93mTotal: {self.state.completed + total_failures}/{total_queued} ({percent:.2f}%)\033[0m  —  "
+            f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
+        )
+
     @handle_user_interrupts
     def run(self) -> None:
         if not self.setup():
             return  # Setup failed, it should have printed an error
-        initial_session_remaining = len(self.state.queue)
-        if initial_session_remaining == 0:
+        initial_queue_length = len(self.state.queue)
+        if initial_queue_length == 0:
             return print_info("No series to process.")
-        total_series = initial_session_remaining + self.state.completed
-        initial_session_eps = self._calculate_total_episodes(self.state.queue)
+        initial_episode_count = self._calculate_total_episodes(self.state.queue)
+        current_failures = 0
         start_time = datetime.now()
-        failures = 0
         self.active_futures = set()
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            for x, series_id in enumerate(self.state.queue.copy()):
+            for position, series_id in enumerate(self.state.queue.copy()):
                 # Check for abort conditions
                 if STOP_EVENT.is_set():
                     break
-                if failures > self.max_failures:
+                if current_failures > self.max_failures:
                     print_error("Script encountered too many failures! Aborting.")
                     break
 
@@ -568,16 +597,12 @@ class SonarrRedownloader:
                     continue
 
                 # Update progress information
-                percent = ((self.state.completed + failures) / total_series) * 100
-                if x > self.state.speed * 2:  # Wait a bit before time estimation
-                    self._calculate_time_estimate(
-                        initial_session_remaining, initial_session_eps, start_time
-                    )
-                set_sticky_text(
-                    f"\033[92mCompleted: {self.state.completed}\033[0m  —  "
-                    f"\033[91mFailed: {failures}\033[0m  —  "
-                    f"\033[93mTotal: {self.state.completed + failures}/{total_series} ({percent:.2f}%)\033[0m  —  "
-                    f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
+                self.update_status(
+                    initial_queue_length,
+                    initial_episode_count,
+                    position,
+                    current_failures,
+                    start_time,
                 )
 
                 # Send a "series search" command to Sonarr
@@ -588,7 +613,7 @@ class SonarrRedownloader:
                         "Sonarr did not respond to 'Series Search' command!",
                         type="error",
                     )
-                    failures += 1
+                    current_failures += 1
                     continue
                 else:
                     msg(f"{series['title']}", "Search started.", type="info")
@@ -608,22 +633,19 @@ class SonarrRedownloader:
                 self.active_futures.add(future)
                 active_limit = 2 if self.state.speed == 2 else 1
                 if len(self.active_futures) >= active_limit:
-                    failures += self._check_failure(self.active_futures)
+                    current_failures += self._check_failure(self.active_futures)
 
             # For speed 1 and 2: All tasks are within our internal queue. Wait for the last batch to complete.
-            while self.active_futures and failures <= self.max_failures:
-                if STOP_EVENT.is_set():
-                    break
-                failures += self._check_failure(self.active_futures)
+            while (
+                self.active_futures
+                and current_failures <= self.max_failures
+                and not STOP_EVENT.is_set()
+            ):
+                current_failures += self._check_failure(self.active_futures)
 
         # Done
         end_sticky_text()
-        elapsed_total = (datetime.now() - start_time).total_seconds()
-        print_success(
-            f"Successfully processed {total_series - len(self.state.queue)} show{'s' if total_series - len(self.state.queue) != 1 else ''} in {humanized_eta(int(elapsed_total))}.\n"
-            f"Failed processing {failures} show{'s' if failures != 1 else ''}.\n"
-            f"Skipped {len(self.state.queue)} show{'s' if len(self.state.queue) != 1 else ''}."
-        )
+        print_success("Processing complete!")
 
 
 if __name__ == "__main__":
