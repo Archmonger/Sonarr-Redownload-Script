@@ -40,6 +40,8 @@ STICKY_TEXT = ""
 def set_sticky_text(text: str) -> None:
     global STICKY_TEXT
     STICKY_TEXT = text
+    if text and text != STICKY_TEXT:
+        _log(text, logging.INFO)
     sys.stdout.write(f"\r\033[K{text}\r")
     sys.stdout.flush()
 
@@ -58,24 +60,29 @@ def _print_text(text: str = "") -> None:
         sys.stdout.write(f"\033[K{STICKY_TEXT}\r")
     sys.stdout.flush()
 
+def _log(text: str, level:int) -> None:
+    # Remove pre-inserted dates from text
+    if text.startswith("[") and "]" in text:
+        text = text.split("] ", 1)[1]
+    logging.log(level, text.encode("utf-8", errors="replace").decode())
 
 def print_success(text: str) -> None:
-    logging.info(text)
+    _log(text, logging.INFO)
     _print_text(f"\033[92m{text}\033[0m")
 
 
 def print_info(text: str) -> None:
-    logging.info(text)
+    _log(text, logging.INFO)
     _print_text(f"\033[96m{text}\033[0m")
 
 
 def print_warning(text: str) -> None:
-    logging.warning(text)
+    _log(text, logging.WARNING)
     _print_text(f"\033[93m{text}\033[0m")
 
 
 def print_error(text: str) -> None:
-    logging.error(text)
+    _log(text, logging.ERROR)
     _print_text(f"\033[91m{text}\033[0m")
 
 
@@ -252,7 +259,7 @@ class SonarrClient:
             if result and (datetime.now() - start_time).total_seconds() < 30:
                 msg(
                     series_title,
-                    "Search finished suspiciously fast... Consider investigating this series and/or your indexer(s).",
+                    "Search finished suspiciously fast...",
                     type="warning",
                 )
             if result is not None:
@@ -285,7 +292,7 @@ class SonarrClient:
         if status in {"failed", "cancelled", "orphaned", "aborted"}:
             msg(
                 series_title,
-                f"Sonarr reported the search has been {status}!",
+                f"Search concluded with status '{status}'.",
                 type="error",
             )
             return False  # Failed command
@@ -301,7 +308,7 @@ class SonarrClient:
         if (datetime.now() - start_time).total_seconds() > MAX_SEARCH_WAIT:
             msg(
                 series_title,
-                f"Took longer than {humanized_eta(MAX_SEARCH_WAIT)} to search. Moving on...",
+                f"Search took longer than {humanized_eta(MAX_SEARCH_WAIT)}. Moving on...",
                 type="warning",
             )
             return True
