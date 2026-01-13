@@ -12,7 +12,7 @@ from concurrent.futures import (
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, cast
+from typing import Dict, Iterable, List, Literal, Optional, Set, cast
 
 import requests
 
@@ -167,7 +167,8 @@ class StateManager:
         self.time_estimate: int = 0
         self.completed: int = 0
         self.speed: Literal[0, 1, 2, 3] = 0
-        self.queue: List[int] = []
+        self.suspicious: Set[int] = set()
+        self.queue: Set[int] = set()
 
     def load(self) -> bool:
         if self.STATE_FILE.is_file():
@@ -179,7 +180,8 @@ class StateManager:
                     self.time_estimate = state.get("time_estimate", 0)
                     self.completed = state.get("completed", 0)
                     self.speed = state.get("speed", 1)
-                    self.queue = state.get("queue", [])
+                    self.suspicious = set(state.get("suspicious", []))
+                    self.queue = set(state.get("queue", []))
                     if self.queue:
                         return True
             except json.JSONDecodeError:
@@ -193,7 +195,8 @@ class StateManager:
             "time_estimate": self.time_estimate,
             "completed": self.completed,
             "speed": self.speed,
-            "queue": self.queue,
+            "suspicious": list(self.suspicious),
+            "queue": list(self.queue),
         }
         with open(self.STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -201,7 +204,7 @@ class StateManager:
     def reset(self) -> None:
         self.time_estimate = 0
         self.completed = 0
-        self.queue = []
+        self.queue = set()
         self.save()
 
 
@@ -249,12 +252,13 @@ class SonarrClient:
 
     def wait_for_search(
         self, command_id: int, series_title: str, series_id: int
-    ) -> tuple[bool, int]:
+    ) -> tuple[bool, int, bool]:
         start_time = datetime.now()
+        suspicious_flag = False
         while not STOP_EVENT.is_set():
             if STOP_EVENT.wait(CHECK_STATUS_INTERVAL):
                 # User requested stop; optimistically believe the ongoing search will be successful
-                return True, series_id 
+                return True, series_id, suspicious_flag
             result = self.check_search_completion(command_id, series_title, start_time)
             if result and (datetime.now() - start_time).total_seconds() < 30:
                 msg(
@@ -263,8 +267,8 @@ class SonarrClient:
                     type="warning",
                 )
             if result is not None:
-                return result, series_id
-        return False, series_id
+                return result, series_id, suspicious_flag
+        return False, series_id, suspicious_flag
 
     def check_search_completion(
         self, command_id: int, series_title: str, start_time: datetime
@@ -283,7 +287,7 @@ class SonarrClient:
                     seconds=float(s),
                 ).total_seconds()
             )
-        humanized_duration = humanized_eta(duration) if duration else "UNKNOWN"
+        humanized_duration = humanized_eta(duration) if duration else "0 seconds"
 
         if not status:
             msg(series_title, "Failed to get command status.", type="error")
@@ -388,7 +392,7 @@ class SonarrRedownloader:
                 max_episodes = float("inf")
 
             self.state.completed = 0
-            self.state.queue = self._filter_series(root_dir, max_episodes)
+            self.state.queue = set(self._filter_series(root_dir, max_episodes))
 
         # Always prompt for speed to allow user to cancel script and adjust
         if self.state.speed != 0:
@@ -441,7 +445,7 @@ class SonarrRedownloader:
     def _get_series_by_id(self, sid: int) -> Optional[Dict]:
         return next((s for s in self.all_series if s["id"] == sid), None)
 
-    def _calculate_total_episodes(self, ids: List[int]) -> int:
+    def _calculate_total_episodes(self, ids: Iterable[int]) -> int:
         count = 0
         for sid in ids:
             s = self._get_series_by_id(sid)
@@ -494,11 +498,13 @@ class SonarrRedownloader:
         for f in done:
             futures.remove(f)
             try:
-                success, series_id = f.result()
+                success, series_id, suspicious = f.result()
+                if suspicious:
+                     self.state.suspicious.add(series_id)
+
                 if not success:
                     failures += 1
-                    if series_id not in self.state.queue:
-                        self.state.queue.append(series_id)
+                    self.state.queue.add(series_id)
                 else:
                     self.state.completed += 1
             except Exception as e:
@@ -516,6 +522,18 @@ class SonarrRedownloader:
             ).lower()
             if retry_input == "y":
                 print_info("Retrying failed searches...")
+                self.resume = True
+                self.run()
+
+    def retry_suspicious_prompt(self):
+        if self.state.suspicious:
+            retry_input = input_bold(
+                "Do you want to retry all suspicious searches? [Y/N]: "
+            ).lower()
+            if retry_input == "y":
+                print_info("Retrying suspicious searches...")
+                self.state.queue.update(self.state.suspicious)
+                self.state.suspicious = set()
                 self.resume = True
                 self.run()
 
@@ -614,6 +632,7 @@ if __name__ == "__main__":
         app = SonarrRedownloader()
         app.run()
         app.retry_failures_prompt()
+        app.retry_suspicious_prompt()
     except KeyboardInterrupt:
         end_sticky_text()
         print_error("Script aborted by user.")
