@@ -1,6 +1,7 @@
 import contextlib
 import json
 import logging
+import re
 import sys
 import threading
 from concurrent.futures import (
@@ -22,7 +23,10 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         RotatingFileHandler(
-            "redownloader.log", maxBytes=50 * 1024 * 1024, backupCount=3
+            "redownloader.log",
+            maxBytes=50 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
         )
     ],
 )
@@ -67,7 +71,10 @@ def _log(text: str, level: int) -> None:
     # Remove pre-inserted dates from text
     if text.startswith("[") and "]" in text:
         text = text.split("] ", 1)[1]
-    logging.log(level, text.encode("utf-8", errors="replace").decode())
+
+    # Strip ANSI escape codes (console font colors)
+    text = re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", text)
+    logging.log(level, text)
 
 
 def print_success(text: str) -> None:
