@@ -11,7 +11,7 @@ from concurrent.futures import (
     wait,
 )
 from datetime import datetime, timedelta
-from logging.handlers import RotatingFileHandler
+from logging import FileHandler
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Set, cast
 
@@ -21,14 +21,7 @@ import requests
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        RotatingFileHandler(
-            "redownloader.log",
-            maxBytes=50 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-    ],
+    handlers=[FileHandler("redownloader.log", encoding="utf-8")],
 )
 
 # Globals
