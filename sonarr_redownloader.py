@@ -30,6 +30,9 @@ MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
 CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
 MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
+SUSPICIOUS_THRESHOLD = (
+    10  # Seconds; searches completing faster than this are suspicious
+)
 STOP_EVENT = threading.Event()
 STICKY_TEXT = ""
 
@@ -67,7 +70,10 @@ def _log(text: str, level: int) -> None:
 
     # Strip ANSI escape codes (console font colors)
     text = re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", text)
-    logging.log(level, text)
+    try:
+        logging.log(level, text)
+    except Exception:
+        _print_text("\033[91mFailed to write to log file!\033[0m")
 
 
 def print_success(text: str) -> None:
@@ -103,7 +109,7 @@ def msg(
 ) -> None:
     """Print a formatted multi-part message to the console."""
     _timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    _msg = "  —  ".join(text) if isinstance(text, tuple) else text
+    _msg = "  -  ".join(text) if isinstance(text, tuple) else text
     _msg = f"[{_timestamp}] {_msg}"
     if type == "info":
         print_info(_msg)
@@ -150,14 +156,8 @@ def handle_user_interrupts(func):
             print_warning("\nWaiting for background tasks to cleanup...")
             for f in self.active_futures:
                 with contextlib.suppress(Exception):
-                    f.result(timeout=10)
-                with contextlib.suppress(Exception):
-                    # The series were optimistically removed from the pending list earlier.
-                    # Since they've made it into Sonarr's queue, we will continue being
-                    # optimistic and count them as completed.
-                    self.state.completed.add(self.active_futures[f])
-                    self.state.save()
-            raise
+                    f.result(timeout=1)
+            print_error("Script aborted by user.")
 
     return wrapper
 
@@ -237,7 +237,7 @@ class SonarrClient:
         params["apikey"] = self.api_key
         kwargs["params"] = params
         for x in range(MAX_CONNECTION_RETRIES):
-            delay = INITIAL_CONNECTION_RETRY_DELAY * (x + 1)
+            delay = INITIAL_CONNECTION_RETRY_DELAY * ((x + 1) * 2)
             with contextlib.suppress(Exception):
                 response = requests.request(method, url, **kwargs)
                 if http_success(response.status_code):
@@ -270,7 +270,10 @@ class SonarrClient:
         # Keep iterating until `check_search_completion` completion/time-out, or STOP_EVENT abort.
         while not STOP_EVENT.is_set() and not STOP_EVENT.wait(CHECK_STATUS_INTERVAL):
             result = self.check_search_completion(command_id, series_title, start_time)
-            if result is True and (datetime.now() - start_time).total_seconds() < 30:
+            if (
+                result is True
+                and (datetime.now() - start_time).total_seconds() < SUSPICIOUS_THRESHOLD
+            ):
                 msg(
                     series_title,
                     "Search finished suspiciously fast...",
@@ -393,6 +396,7 @@ class SonarrRedownloader:
             self.state.api_key = api_key
 
     def _configure_preferences(self):
+        # Only prompt for root directory and max episodes if not resuming a previous session
         if not self.resume:
             root_dir = input_bold("Root directory to upgrade (optional): ")
             try:
@@ -405,7 +409,7 @@ class SonarrRedownloader:
             self.state.reset()
             self.state.queue = set(self._filter_series(root_dir, max_episodes))
 
-        # Always prompt for speed to allow user to cancel script and adjust
+        # Settings to always prompt for (speed, retries, etc.)
         if self.state.speed != 0:
             print_info(f"Previous speed '{self.state.speed}' [Enter to re-use]")
         while True:
@@ -430,6 +434,8 @@ class SonarrRedownloader:
                 break
             else:
                 print_warning("Invalid speed level. Please enter 1, 2, 3, or 4.")
+        self.retry_failures_prompt(immediate=False)
+        self.retry_suspicious_prompt(immediate=False)
 
     def _filter_series(self, root_dir: str, max_episodes: float) -> List[int]:
         ids = []
@@ -513,6 +519,8 @@ class SonarrRedownloader:
                     self.state.failures.add(series_id)
                 else:
                     self.state.completed.add(series_id)
+                self.state.queue.remove(series_id)
+
             except Exception as e:
                 failures += 1
                 print_error(
@@ -521,29 +529,34 @@ class SonarrRedownloader:
         self.state.save()
         return failures
 
-    def retry_failures_prompt(self):
+    def retry_failures_prompt(self, immediate: bool = True):
         if self.state.failures:
             retry_input = input_bold(
                 "Do you want to retry all failed searches? [Y/N]: "
             ).lower()
             if retry_input == "y":
-                print_info("Retrying failed searches...")
                 self.state.queue.update(self.state.failures)
                 self.state.failures = set()
-                self.resume = True
-                self.run()
+                self.state.time_estimate = 0
+                if immediate:
+                    print_info("Retrying failed searches...")
+                    self.resume = True
+                    self.run()
 
-    def retry_suspicious_prompt(self):
+    def retry_suspicious_prompt(self, immediate: bool = True):
         if self.state.suspicious:
             retry_input = input_bold(
                 "Do you want to retry all suspicious searches? [Y/N]: "
             ).lower()
             if retry_input == "y":
-                print_info("Retrying suspicious searches...")
                 self.state.queue.update(self.state.suspicious)
+                self.state.completed.difference_update(self.state.queue)
                 self.state.suspicious = set()
-                self.resume = True
-                self.run()
+                self.state.time_estimate = 0
+                if immediate:
+                    print_info("Retrying suspicious searches...")
+                    self.resume = True
+                    self.run()
 
     def update_status(
         self,
@@ -563,9 +576,9 @@ class SonarrRedownloader:
                 initial_queue_length, initial_episode_count, start_time
             )
         set_sticky_text(
-            f"\033[92mCompleted: {len(self.state.completed)}\033[0m  —  "
-            f"\033[91mFailed: {total_failures}\033[0m  —  "
-            f"\033[93mTotal: {len(self.state.completed) + total_failures}/{total} ({percent:.2f}%)\033[0m  —  "
+            f"\033[92mCompleted: {len(self.state.completed)}\033[0m  -  "
+            f"\033[91mFailed: {total_failures}\033[0m  -  "
+            f"\033[93mTotal: {len(self.state.completed) + total_failures}/{total} ({percent:.2f}%)\033[0m  -  "
             f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
         )
 
@@ -620,12 +633,6 @@ class SonarrRedownloader:
                 else:
                     msg(f"{series['title']}", "Search started.", type="info")
 
-                # Sonarr successfully received the search request. Optimistically remove it
-                # from our pending list in case the user terminates the script.
-                if series_id in self.state.queue:
-                    self.state.queue.remove(series_id)
-                self.state.save()
-
                 # Wait for search to complete, depending on speed setting
                 if self.state.speed == 4:
                     continue  # Fastest speed does not wait for task completion
@@ -656,9 +663,6 @@ if __name__ == "__main__":
         app.run()
         app.retry_failures_prompt()
         app.retry_suspicious_prompt()
-    except KeyboardInterrupt:
-        end_sticky_text()
-        print_error("Script aborted by user.")
     except Exception as e:
         end_sticky_text()
         print_error(f"An unexpected error occurred: {e}")
