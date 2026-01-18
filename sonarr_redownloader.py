@@ -1,9 +1,10 @@
+import argparse
 import contextlib
 import json
 import logging
-import re
 import sys
 import threading
+import time
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -16,13 +17,31 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Set, cast
 
 import requests
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Grid, Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Log,
+    ProgressBar,
+    Rule,
+    Static,
+)
 
-# Set up logging
+# Set up logging for file (console logging will be handled by Textual)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[FileHandler("redownloader.log", encoding="utf-8")],
 )
+logger = logging.getLogger(__name__)
 
 # Globals
 MAX_SEARCH_WAIT = 5400  # Time in seconds
@@ -30,95 +49,28 @@ MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
 CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
 MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
-SUSPICIOUS_THRESHOLD = (
-    10  # Seconds; searches completing faster than this are suspicious
-)
+SUSPICIOUS_THRESHOLD = 10  # Seconds; searches completing faster are suspicious
 STOP_EVENT = threading.Event()
-STICKY_TEXT = ""
+PAUSE_EVENT = threading.Event()
+PAUSE_EVENT.set()
+SPEED_HELP_TEXT = (
+    "1: Slow (sequential)\n"
+    "2: Medium (two concurrent) [recommended]\n"
+    "3: Fast (three concurrent)\n"
+    "4: Turbo (infinite)"
+)
 
 
-def set_sticky_text(text: str) -> None:
-    global STICKY_TEXT
-    if not text:
-        return
-    if text != STICKY_TEXT:
-        _log(text, logging.INFO)
-    STICKY_TEXT = text
-    sys.stdout.write(f"\r\033[K{text}\r")
-    sys.stdout.flush()
+class TextualLogHandler(logging.Handler):
+    """Redirects log messages to a Textual Log widget."""
 
+    def __init__(self, log_widget: Log):
+        super().__init__()
+        self.log_widget = log_widget
 
-def end_sticky_text() -> None:
-    global STICKY_TEXT
-    if STICKY_TEXT:
-        sys.stdout.write(f"\r\033[K{STICKY_TEXT}\n")
-        sys.stdout.flush()
-        STICKY_TEXT = ""
-
-
-def _print_text(text: str = "") -> None:
-    sys.stdout.write(f"\r\033[K{text}\n")
-    if STICKY_TEXT:
-        sys.stdout.write(f"\033[K{STICKY_TEXT}\r")
-    sys.stdout.flush()
-
-
-def _log(text: str, level: int) -> None:
-    # Remove pre-inserted dates from text
-    if text.startswith("[") and "]" in text:
-        text = text.split("] ", 1)[1]
-
-    # Strip ANSI escape codes (console font colors)
-    text = re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", text)
-    try:
-        logging.log(level, text)
-    except Exception:
-        _print_text("\033[91mFailed to write to log file!\033[0m")
-
-
-def print_success(text: str) -> None:
-    _log(text, logging.INFO)
-    _print_text(f"\033[92m{text}\033[0m")
-
-
-def print_info(text: str) -> None:
-    _log(text, logging.INFO)
-    _print_text(f"\033[96m{text}\033[0m")
-
-
-def print_warning(text: str) -> None:
-    _log(text, logging.WARNING)
-    _print_text(f"\033[93m{text}\033[0m")
-
-
-def print_error(text: str) -> None:
-    _log(text, logging.ERROR)
-    _print_text(f"\033[91m{text}\033[0m")
-
-
-def input_bold(text: str) -> str:
-    return input(f"\033[1m{text}\033[0m")
-
-
-def input_warning(text: str) -> str:
-    return input(f"\033[93m{text}\033[0m")
-
-
-def msg(
-    *text: str, type: Literal["info", "success", "warning", "error"] = "info"
-) -> None:
-    """Print a formatted multi-part message to the console."""
-    _timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    _msg = "  -  ".join(text) if isinstance(text, tuple) else text
-    _msg = f"[{_timestamp}] {_msg}"
-    if type == "info":
-        print_info(_msg)
-    elif type == "success":
-        print_success(_msg)
-    elif type == "warning":
-        print_warning(_msg)
-    elif type == "error":
-        print_error(_msg)
+    def emit(self, record):
+        msg = self.format(record)
+        self.log_widget.write_line(msg)
 
 
 def humanized_eta(seconds: int) -> str:
@@ -146,26 +98,11 @@ def http_success(status_code: int) -> bool:
     return 200 <= status_code < 300
 
 
-def handle_user_interrupts(func):
-    def wrapper(self: "SonarrRedownloader", *args, **kwargs):
-        try:
-            return func(self, *args, **kwargs)
-        except KeyboardInterrupt:
-            STOP_EVENT.set()
-            end_sticky_text()
-            print_warning("\nWaiting for background tasks to cleanup...")
-            for f in self.active_futures:
-                with contextlib.suppress(Exception):
-                    f.result(timeout=1)
-            print_error("Script aborted by user.")
-
-    return wrapper
-
-
 class StateManager:
     STATE_FILE = Path("redownloader_state.json")
 
-    def __init__(self):
+    def __init__(self, dummy_mode: bool = False):
+        self.dummy_mode = dummy_mode
         self.sonarr_url: str = ""
         self.api_key: str = ""
         self.time_estimate: int = 0
@@ -174,6 +111,30 @@ class StateManager:
         self.suspicious: Set[int] = set()
         self.failures: Set[int] = set()
         self.queue: Set[int] = set()
+
+    def sanitize_queue(self) -> None:
+        """Ensure no overlap between queue and completed/failures."""
+        if self.queue:
+            original_len = len(self.queue)
+            self.queue -= self.completed
+            self.queue -= self.failures
+            if len(self.queue) != original_len:
+                logger.info(
+                    f"Removed {original_len - len(self.queue)} duplicate/completed items from queue."
+                )
+
+    def requeue_failures(self) -> None:
+        """Move failed items back to the queue."""
+        if self.failures:
+            self.queue.update(self.failures)
+            self.failures.clear()
+
+    def requeue_suspicious(self) -> None:
+        """Move suspicious items back to the queue and remove from completed."""
+        if self.suspicious:
+            self.queue.update(self.suspicious)
+            self.completed.difference_update(self.suspicious)
+            self.suspicious.clear()
 
     def load(self) -> bool:
         if self.STATE_FILE.is_file():
@@ -189,15 +150,21 @@ class StateManager:
                     self.failures = set(state.get("failures", []))
                     self.queue = set(state.get("queue", []))
 
+                    self.sanitize_queue()
+
                     # Determine if there's any state to resume
                     if self.queue or self.failures or self.suspicious:
                         return True
             except Exception:
-                print_error("State file corrupted.")
-                raise
+                logger.error("State file corrupted.")
+                # Don't raise, just treat as empty
         return False
 
     def save(self) -> None:
+        if self.dummy_mode:
+            logger.info("Dummy mode: Skipping state save.")
+            return
+
         state = {
             "sonarr_url": self.sonarr_url,
             "api_key": self.api_key,
@@ -221,13 +188,14 @@ class StateManager:
 
 
 class SonarrClient:
-    def __init__(self, url: str, api_key: str):
-        if not url:
+    def __init__(self, url: str, api_key: str, dummy_mode: bool = False):
+        if not dummy_mode and not url:
             raise ValueError("Sonarr URL cannot be empty.")
-        if not api_key:
+        if not dummy_mode and not api_key:
             raise ValueError("Sonarr API key cannot be empty.")
-        self.url = url.rstrip("/")
+        self.url = url.rstrip("/") if url else ""
         self.api_key = api_key
+        self.dummy_mode = dummy_mode
 
     def _request(
         self, method: str, endpoint: str, **kwargs
@@ -237,13 +205,17 @@ class SonarrClient:
         params["apikey"] = self.api_key
         kwargs["params"] = params
         for x in range(MAX_CONNECTION_RETRIES):
+            # Check stop event first
+            if STOP_EVENT.is_set():
+                return None
+
             delay = INITIAL_CONNECTION_RETRY_DELAY * ((x + 1) * 2)
             with contextlib.suppress(Exception):
                 response = requests.request(method, url, **kwargs)
                 if http_success(response.status_code):
                     return response
 
-            print_warning(
+            logger.warning(
                 f"Connection to Sonarr failed. Retrying in {humanized_eta(delay)}..."
             )
             if STOP_EVENT.wait(delay):
@@ -258,11 +230,20 @@ class SonarrClient:
 
     def search_series(self, series_id: int) -> Optional[int]:
         """Triggers a SeriesSearch and returns the command ID."""
+        if self.dummy_mode:
+            logger.info(f"Dummy mode: Simulate search for series {series_id}")
+            return 999999
+
         payload = {"name": "SeriesSearch", "seriesId": series_id}
         response = self._request("POST", "/command", json=payload)
         return response.json().get("id") if response else None
 
     def wait_for_search(self, command_id: int, series_title: str) -> tuple[bool, bool]:
+        if self.dummy_mode:
+            logger.info(f"Dummy mode: Simulating search for {series_title}")
+            time.sleep(1.5)
+            return True, False
+
         start_time = datetime.now()
         success_flag = False
         suspicious_flag = False
@@ -274,11 +255,7 @@ class SonarrClient:
                 result is True
                 and (datetime.now() - start_time).total_seconds() < SUSPICIOUS_THRESHOLD
             ):
-                msg(
-                    series_title,
-                    "Search finished suspiciously fast...",
-                    type="warning",
-                )
+                logger.warning(f"[{series_title}] Search finished suspiciously fast...")
                 suspicious_flag = True
             if result is not None:
                 success_flag = result
@@ -305,159 +282,450 @@ class SonarrClient:
         humanized_duration = humanized_eta(duration) if duration else "0 seconds"
 
         if not status:
-            msg(series_title, "Failed to get command status.", type="error")
+            logger.error(f"[{series_title}] Failed to get command status.")
             return False  # Failed communication
 
         if status in {"failed", "cancelled", "orphaned", "aborted"}:
-            msg(
-                series_title,
-                f"Search concluded with status '{status}'.",
-                type="error",
-            )
+            logger.error(f"[{series_title}] Search concluded with status '{status}'.")
             return False  # Failed command
 
         if status == "completed":
-            msg(
-                series_title,
-                f"Search completed in {humanized_duration}.",
-                type="success",
-            )
+            logger.info(f"[{series_title}] Search completed in {humanized_duration}.")
             return True  # Success
 
         if (datetime.now() - start_time).total_seconds() > MAX_SEARCH_WAIT:
-            msg(
-                series_title,
-                f"Search took longer than {humanized_eta(MAX_SEARCH_WAIT)}. Moving on...",
-                type="warning",
+            logger.warning(
+                f"[{series_title}] Search took longer than {humanized_eta(MAX_SEARCH_WAIT)}. Moving on..."
             )
             return True
 
         return None  # Still running
 
 
-class SonarrRedownloader:
-    def __init__(self):
-        self.state = StateManager()
-        self.client: SonarrClient
-        self.resume = False
-        self.all_series = []
-        self.max_failures = 0
-        self.active_futures: Dict[Future, int] = {}
+# --- UI Screens ---
 
-    def setup(self):
-        # 1. Load state
-        if (
-            not self.resume
-            and self.state.load()
-            and (input_bold("Resume previous search? [Y/N]: ").lower() == "y")
-        ):
-            self.resume = True
 
-        # 2. Configure Connection
-        if not self.resume:
-            self._configure_connection()
-        self.client = SonarrClient(self.state.sonarr_url, self.state.api_key)
+class QuestionModal(ModalScreen[bool]):
+    """A simple Yes/No modal."""
 
-        # 3. Connect and fetch series
-        print_info("Connecting to Sonarr...")
-        try:
-            self.all_series = self.client.get_all_series()
-            print_info(f"Connected! Found {len(self.all_series)} series.")
-        except ConnectionError as e:
-            print_error(str(e))
-            return False
+    def __init__(self, question: str, description: str = ""):
+        super().__init__()
+        self.question = question
+        self.description = description
 
-        # 4. Prompt for user settings / preferences
-        self._configure_preferences()
-        self.state.save()
+    def compose(self) -> ComposeResult:
+        with Container(classes="modal"):
+            yield Label(self.question, classes="question", shrink=True)
+            if self.description:
+                yield Label(self.description, classes="help-text", shrink=True)
+            with Horizontal(classes="buttons"):
+                yield Button("Yes", variant="primary", id="yes")
+                yield Button("No", variant="error", id="no")
 
-        # 5. Adjust max failures
-        if len(self.state.queue) > 0:
-            self.max_failures = round(len(self.state.queue) * MAX_FAILURE_RATIO)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
 
-        return True
 
-    def _configure_connection(self):
-        if self.state.sonarr_url:
-            print_info(f"Previous URL: {self.state.sonarr_url}")
-        if self.state.api_key:
-            print_info("Previous API Key: ***********")
+class StartupModal(ModalScreen[str]):
+    """Modal to ask about resuming, starting new, or quitting."""
 
-        url = input_bold(
-            f"Sonarr URL {self.state.sonarr_url and '[Enter to re-use]'}: "
-        )
-        if url:
-            self.state.sonarr_url = url
-
-        api_key = input_bold(
-            f"Sonarr API Key {self.state.api_key and '[Enter to re-use]'}: "
-        )
-        if api_key:
-            self.state.api_key = api_key
-
-    def _configure_preferences(self):
-        # Only prompt for root directory and max episodes if not resuming a previous session
-        if not self.resume:
-            root_dir = input_bold("Root directory to upgrade (optional): ")
-            try:
-                max_episodes = int(
-                    input_bold("Skip shows with greater than X episodes (optional): ")
-                )
-            except ValueError:
-                max_episodes = float("inf")
-
-            self.state.reset()
-            self.state.queue = set(self._filter_series(root_dir, max_episodes))
-
-        # Settings to always prompt for (speed, retries, etc.)
-        if self.state.speed != 0:
-            print_info(f"Previous speed '{self.state.speed}' [Enter to re-use]")
-        while True:
-            speed_input = cast(
-                Literal[1, 2, 3, 4],
-                int(
-                    input_bold("Search speed [1-4] (optional): ")
-                    or self.state.speed
-                    or 2
-                ),
+    def compose(self) -> ComposeResult:
+        with Container(classes="modal"):
+            yield Label(
+                "Previous session detected. What would you like to do?",
+                classes="question",
             )
-            if speed_input == 4:
-                confirm = input_warning(
-                    "Speed '4' queues everything at once! This is difficult to stop once started, and most indexers will block or rate limit you.\n"
-                    "Are you sure? [Y/N]: "
+            with Horizontal(classes="buttons"):
+                yield Button("Resume", variant="success", id="resume")
+                yield Button("Start New", variant="primary", id="new")
+                yield Button("Quit", variant="error", id="quit")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id)
+
+
+class AlertModal(ModalScreen[None]):
+    """A simple OK modal."""
+
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Container(classes="modal"):
+            yield Label(self.message, classes="question")
+            yield Button("OK", variant="primary", id="ok")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+
+class ResumeModal(ModalScreen[tuple[bool, bool, int]]):
+    """Modal to ask about re-queueing failed and suspicious items."""
+
+    def __init__(self, failed_count: int, suspicious_count: int, current_speed: int):
+        super().__init__()
+        self.failed_count = failed_count
+        self.suspicious_count = suspicious_count
+        self.current_speed = current_speed
+
+    def compose(self) -> ComposeResult:
+        with Container(classes="modal"):
+            yield Label("Resume Options", classes="heading")
+            if self.failed_count or self.suspicious_count:
+                yield Label("Re-insert into queue:")
+                if self.failed_count > 0:
+                    yield Checkbox(f"Failed items ({self.failed_count})", id="failed")
+                if self.suspicious_count > 0:
+                    yield Checkbox(
+                        f"Suspicious items ({self.suspicious_count})", id="suspicious"
+                    )
+
+            yield Label("\nSpeed (1-4):")
+            yield Label(SPEED_HELP_TEXT, classes="help-text")
+            yield Input(value=str(self.current_speed), id="speed", type="number")
+
+            with Horizontal(classes="buttons"):
+                yield Button("Continue", variant="primary", id="submit")
+                yield Button("Quit", variant="error", id="quit")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "submit":
+            failed = (
+                self.query_one("#failed", Checkbox).value
+                if self.failed_count > 0
+                else False
+            )
+            suspicious = (
+                self.query_one("#suspicious", Checkbox).value
+                if self.suspicious_count > 0
+                else False
+            )
+
+            try:
+                speed_val = self.query_one("#speed", Input).value
+                speed = int(speed_val) if speed_val else 2
+                if speed not in {1, 2, 3, 4}:
+                    raise ValueError
+            except ValueError:
+                self.app.push_screen(AlertModal("Speed must be 1, 2, 3 or 4."))
+                return
+
+            if speed == 4:
+                confirm = await self.app.push_screen_wait(
+                    QuestionModal(
+                        "Turbo speed is DANGEROUS!",
+                        "This speed queues everything at once! "
+                        "This is difficult to stop once started, and most "
+                        "indexers will rate limit or temporarily ban you.\n\n"
+                        "Are you sure you want to proceed?",
+                    )
                 )
-                if confirm.lower() == "y":
-                    self.state.speed = 4
-                    break
-            elif speed_input in {1, 2, 3}:
-                self.state.speed = speed_input
-                break
-            else:
-                print_warning("Invalid speed level. Please enter 1, 2, 3, or 4.")
-        self.retry_failures_prompt(immediate=False)
-        self.retry_suspicious_prompt(immediate=False)
+                if not confirm:
+                    return
 
-    def _filter_series(self, root_dir: str, max_episodes: float) -> List[int]:
-        ids = []
-        for s in self.all_series:
+            self.dismiss((failed, suspicious, speed))
+        elif event.button.id == "quit":
+            await self.app.action_quit()
+
+
+class ConfigurationScreen(Screen):
+    """Screen for configuring connection and preferences."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state = state_manager
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(classes="config-container"):
+            yield Label("[b]Configuration[/b]", classes="heading")
+            yield Label("Sonarr URL:")
+            yield Input(
+                value=self.state.sonarr_url,
+                placeholder="http://localhost:8989",
+                id="url",
+            )
+            yield Label("API Key:")
+            yield Input(
+                value=self.state.api_key, placeholder="API Key", password=True, id="key"
+            )
+
+            yield Rule()
+            yield Label("Root Directory (Optional - for filtering):")
+            yield Input(placeholder="e.g. /tv", id="root_dir")
+            yield Label("Max Episodes (Optional - skip large shows):")
+            yield Input(placeholder="e.g. 100", id="max_eps", type="number")
+
+            yield Rule()
+            yield Label("Speed (1-4):")
+            yield Label(SPEED_HELP_TEXT, classes="help-text")
+            yield Input(value=str(self.state.speed or 2), id="speed", type="number")
+
+            yield Button("Start", variant="success", id="start", classes="submit-btn")
+        yield Footer()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "start":
+            return
+
+        # Save inputs
+        url = self.query_one("#url", Input).value
+        key = self.query_one("#key", Input).value
+        root_dir = self.query_one("#root_dir", Input).value
+        max_eps_str = self.query_one("#max_eps", Input).value
+        speed_str = self.query_one("#speed", Input).value
+
+        if not url or not key:
+            self.app.push_screen(AlertModal("URL and API Key are required."))
+            return
+
+        self.state.sonarr_url = url
+        self.state.api_key = key
+
+        try:
+            max_eps = int(max_eps_str) if max_eps_str else float("inf")
+        except ValueError:
+            max_eps = float("inf")
+
+        try:
+            speed = int(speed_str) if speed_str else 2
+            if speed not in {1, 2, 3, 4}:
+                raise ValueError
+        except ValueError:
+            self.app.push_screen(AlertModal("Speed must be 1, 2, 3 or 4."))
+            return
+
+        if speed == 4:
+            confirm = await self.app.push_screen_wait(
+                QuestionModal(
+                    "Turbo speed is DANGEROUS!",
+                    "This speed queues everything at once! "
+                    "This is difficult to stop once started, and most "
+                    "indexers will rate limit or temporarily ban you.\n\n"
+                    "Are you sure you want to proceed?",
+                )
+            )
+            if not confirm:
+                return
+
+        self.state.speed = cast(Literal[0, 1, 2, 3, 4], speed)
+
+        # Reset queue if we are configuring from scratch (not resuming)
+        # Logic: If we are here, we are not resuming, OR we are resuming but wanted to reconfig.
+        # But the 'Resume' flow skips this screen. So we can assume new filters apply.
+        # However, we need to fetch series first to filter.
+
+        loading_idx = self.app.push_screen(AlertModal("Connecting to Sonarr..."))
+
+        # Run connection check in worker to not block UI
+        self.run_connection_and_filter(url, key, root_dir, max_eps, loading_idx)
+
+    @work(thread=True)
+    def run_connection_and_filter(self, url, key, root_dir, max_eps, loading_modal):
+        try:
+            self.app: SonarrRedownloader
+            client = SonarrClient(
+                url, key, dummy_mode=self.app.state_manager.dummy_mode
+            )
+            series = client.get_all_series()
+        except Exception as e:
+            self.app.call_from_thread(loading_modal.dismiss, None)
+            self.app.call_from_thread(
+                self.app.push_screen, AlertModal(f"Connection failed: {str(e)}")
+            )
+            return
+
+        # Filter
+        queue = []
+        for s in series:
             if root_dir and not s["path"].startswith(root_dir):
-                continue  # Skip series not in the specified root directory
-
+                continue
             stats = s.get("statistics")
             if not stats:
-                print_warning(
-                    f"Skipping series '{s['title']}' due to missing statistics."
-                )
                 continue
-
-            if stats["episodeFileCount"] > max_episodes:
-                print_info(
-                    f"Skipping series '{s['title']}' due to episode count ({stats['episodeFileCount']})."
-                )
+            if stats["episodeFileCount"] > max_eps:
                 continue
+            queue.append(s["id"])
 
-            ids.append(s["id"])
-        return ids
+        self.app.call_from_thread(loading_modal.dismiss, None)
+
+        # Update state
+        self.state.reset()
+        self.state.queue = set(queue)
+        self.state.save()
+
+        # Start main processing
+        self.app.call_from_thread(self.dismiss, (client, series))
+
+
+class MainScreen(Screen):
+    """The main processing screen."""
+
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("shift+p", "toggle_pause", "Pause"),
+        Binding("shift+e", "end", "End Task"),
+    ]
+
+    def action_end(self):
+        STOP_EVENT.set()
+        self.query_one("#remaining_time", Static).update("STOPPING...")
+        logger.info("Ending current task by user hotkey.")
+
+    def action_toggle_pause(self):
+        if PAUSE_EVENT.is_set():
+            PAUSE_EVENT.clear()
+            logger.info("Paused by user.")
+            self.query_one("#remaining_time", Static).update("PAUSED")
+        else:
+            PAUSE_EVENT.set()
+            logger.info("Resumed by user.")
+            self.query_one("#remaining_time", Static).update("Resuming...")
+
+    def __init__(
+        self, state_manager: StateManager, client: SonarrClient, all_series: List[Dict]
+    ):
+        super().__init__()
+        self.state = state_manager
+        self.client = client
+        self.all_series = all_series
+        self.max_failures = 0
+
+        # Progress Tracking
+        self.initial_queue_length = len(self.state.queue)
+        self.start_time = datetime.now()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(classes="main-container"):
+            with Container(classes="status-box"):
+                with Grid(classes="status-grid"):
+                    with Vertical(classes="status-item box-completed"):
+                        yield Label("Completed", classes="status-label")
+                        yield Static("0", id="completed_count", classes="status-value")
+
+                    with Vertical(classes="status-item box-failed"):
+                        yield Label("Failed", classes="status-label")
+                        yield Static(
+                            "0", id="failed_count", classes="status-value failure"
+                        )
+
+                    with Vertical(classes="status-item box-total"):
+                        yield Label("Total", classes="status-label")
+                        yield Static("0", id="total_count", classes="status-value")
+
+                    with Vertical(classes="status-item box-remaining"):
+                        yield Label("Remaining", classes="status-label")
+                        yield Static(
+                            "Calculating...",
+                            id="remaining_time",
+                            classes="status-value",
+                        )
+
+                yield Static("", id="percentage_text", classes="percentage-text")
+                yield ProgressBar(
+                    total=100, show_eta=False, show_percentage=False, id="progress_bar"
+                )
+
+            yield Log(id="log_view")
+
+        yield Footer()
+
+    def on_mount(self):
+        # Setup logging
+        log_widget = self.query_one("#log_view", Log)
+        handler = TextualLogHandler(log_widget)
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
+        logging.getLogger().addHandler(handler)
+
+        # Calc max failures
+        if self.state.queue:
+            self.max_failures = round(len(self.state.queue) * MAX_FAILURE_RATIO)
+
+        self.start_processing()
+
+    @work(thread=True)
+    def start_processing(self):
+        STOP_EVENT.clear()
+        initial_queue_len = len(self.state.queue)
+        if initial_queue_len == 0:
+            logger.info("No series to process.")
+            self.app.call_from_thread(self.finished_processing)
+            return
+
+        active_futures: Dict[Future, int] = {}
+        current_failures = 0
+        total_episodes = self._calculate_total_episodes(self.state.queue)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for position, series_id in enumerate(self.state.queue.copy()):
+                # Exit during a stop event
+                if STOP_EVENT.is_set():
+                    break
+
+                # Wait during a pause event (user might also issue a `stop` while paused, so we must check that too)
+                while not PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+                    time.sleep(0.5)
+
+                if current_failures > self.max_failures:
+                    logger.error("Too many failures. Aborting.")
+                    break
+
+                series = self._get_series_by_id(series_id)
+                if not series:
+                    logger.warning(f"Series ID {series_id} not found.")
+                    continue
+
+                # Update UI
+                self.app.call_from_thread(
+                    self.update_status,
+                    len(self.state.completed),
+                    len(self.state.failures),
+                    initial_queue_len,
+                    total_episodes,
+                )
+
+                # Trigger Search
+                try:
+                    command_id = self.client.search_series(series_id)
+                except Exception as e:
+                    logger.error(f"Error triggering search for {series['title']}: {e}")
+                    current_failures += 1
+                    continue
+
+                if not command_id:
+                    logger.error(f"[{series['title']}] No command ID returned.")
+                    current_failures += 1
+                    continue
+
+                logger.info(f"[{series['title']}] Search started.")
+
+                if self.state.speed == 4:
+                    continue
+
+                f = executor.submit(
+                    self.client.wait_for_search, command_id, series["title"]
+                )
+                active_futures[f] = series_id
+
+                if len(active_futures) >= self.state.speed:
+                    current_failures += self._check_failure(
+                        active_futures, initial_queue_len, total_episodes
+                    )
+
+            # Wait for remaining
+            while (
+                active_futures
+                and current_failures <= self.max_failures
+                and not STOP_EVENT.is_set()
+            ):
+                current_failures += self._check_failure(
+                    active_futures, initial_queue_len, total_episodes
+                )
+
+        self.app.call_from_thread(self.finished_processing)
 
     def _get_series_by_id(self, sid: int) -> Optional[Dict]:
         return next((s for s in self.all_series if s["id"] == sid), None)
@@ -473,196 +741,384 @@ class SonarrRedownloader:
     def _calculate_time_estimate(
         self, queue_length: int, episode_count: int, start_time: datetime
     ) -> None:
-        # Sometimes, 'SeriesSearch' falls back to searching for individual episodes,
-        # so we average several estimates to improve accuracy.
+        # Sometimes 'SeriesSearch' falls back to searching for individual episodes.
+        # Since we don't know if this will occur, we must average several estimate
+        # methods to improve accuracy.
         remaining_searches = len(self.state.queue)
         if remaining_searches < queue_length:
             remaining_eps = self._calculate_total_episodes(self.state.queue)
             elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed <= 0:
+                return
 
-            # Based on remaining episodes count
+            # Time estimate based on remaining episodes
             eps_completed = episode_count - remaining_eps + 1
-            est_ep = (elapsed / eps_completed) * remaining_eps
+            est_ep = (
+                (elapsed / eps_completed) * remaining_eps if eps_completed > 0 else 0
+            )
 
-            # Based on remaining series count
+            # Time estimate based on remaining series count
             session_completed = queue_length - remaining_searches + 1
-            est_series = (elapsed / session_completed) * remaining_searches
+            if session_completed > 0:
+                est_series = (elapsed / session_completed) * remaining_searches
+            else:
+                est_series = 0
 
             # Set the value within the state storage
             # Average with previous estimate for smoothing, if possible
-            new_estimate = int((est_ep + est_series) / 2)
-            self.state.time_estimate = (
-                int((self.state.time_estimate + new_estimate) / 2)
-                if self.state.time_estimate > 0
-                else new_estimate
-            )
+            if est_ep > 0 or est_series > 0:
+                new_estimate = int((est_ep + est_series) / 2)
+                self.state.time_estimate = (
+                    int((self.state.time_estimate + new_estimate) / 2)
+                    if self.state.time_estimate > 0
+                    else new_estimate
+                )
 
-    def _check_failure(self, futures: Dict[Future, int]) -> int:
-        """
-        Waits for a 'future' (series search) to complete. Returns the number of failures that occurred.
-        """
+    def _check_failure(
+        self,
+        futures: Dict[Future, int],
+        initial_queue_len: int,
+        initial_total_episodes: int,
+    ) -> int:
         if not futures:
             return 0
-
         done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
         failures = 0
         for f in done:
             series_id = futures.pop(f)
-
             try:
                 success, suspicious = f.result()
                 if suspicious:
                     self.state.suspicious.add(series_id)
-
                 if not success:
                     failures += 1
                     self.state.failures.add(series_id)
                 else:
                     self.state.completed.add(series_id)
-                self.state.queue.remove(series_id)
 
+                if series_id in self.state.queue:
+                    self.state.queue.remove(series_id)
             except Exception as e:
                 failures += 1
-                print_error(
-                    f"An unexpected error occurred while processing a series: {e}"
-                )
+                logger.error(f"Error in future result: {e}")
+
         self.state.save()
+
+        self.app.call_from_thread(
+            self.update_status,
+            len(self.state.completed),
+            len(self.state.failures),
+            initial_queue_len,
+            initial_total_episodes,
+        )
         return failures
-
-    def retry_failures_prompt(self, immediate: bool = True):
-        if self.state.failures:
-            retry_input = input_bold(
-                "Do you want to retry all failed searches? [Y/N]: "
-            ).lower()
-            if retry_input == "y":
-                self.state.queue.update(self.state.failures)
-                self.state.failures = set()
-                self.state.time_estimate = 0
-                if immediate:
-                    print_info("Retrying failed searches...")
-                    self.resume = True
-                    self.run()
-
-    def retry_suspicious_prompt(self, immediate: bool = True):
-        if self.state.suspicious:
-            retry_input = input_bold(
-                "Do you want to retry all suspicious searches? [Y/N]: "
-            ).lower()
-            if retry_input == "y":
-                self.state.queue.update(self.state.suspicious)
-                self.state.completed.difference_update(self.state.queue)
-                self.state.suspicious = set()
-                self.state.time_estimate = 0
-                if immediate:
-                    print_info("Retrying suspicious searches...")
-                    self.resume = True
-                    self.run()
 
     def update_status(
         self,
-        initial_queue_length: int,
-        initial_episode_count: int,
-        queue_position: int,
-        current_failures: int,
-        start_time: datetime,
-    ) -> None:
-        total_failures = len(self.state.failures) + current_failures
-        total = (
-            len(self.state.queue) + len(self.state.failures) + len(self.state.completed)
+        completed: int,
+        failed: int,
+        initial_queue_len: int,
+        initial_total_ep: int,
+    ):
+        total_items = (
+            len(self.state.completed) + len(self.state.failures) + len(self.state.queue)
         )
-        percent = ((len(self.state.completed) + total_failures) / total) * 100
-        if queue_position > self.state.speed * 2:  # Wait a bit before time estimation
-            self._calculate_time_estimate(
-                initial_queue_length, initial_episode_count, start_time
+
+        progress = self.query_one("#progress_bar", ProgressBar)
+        progress.total = total_items
+        progress.progress = completed + failed
+        percent = ((completed + failed) / total_items * 100) if total_items > 0 else 0
+
+        self.query_one("#completed_count", Static).update(str(completed))
+        self.query_one("#failed_count", Static).update(str(failed))
+        self.query_one("#total_count", Static).update(str(total_items))
+        self.query_one("#percentage_text", Static).update(f"{percent:.1f}% Complete")
+
+        if not PAUSE_EVENT.is_set():
+            self.query_one("#remaining_time", Static).update("PAUSED")
+            return
+        self._calculate_time_estimate(
+            initial_queue_len, initial_total_ep, self.start_time
+        )
+        self.query_one("#remaining_time", Static).update(
+            humanized_eta(self.state.time_estimate)
+        )
+
+    async def finished_processing(self):
+        logger.info("Processing complete!")
+        retry = False
+        if self.state.failures and await self.app.push_screen_wait(
+            QuestionModal("Queue fully processed. Retry failed items?")
+        ):
+            self.state.requeue_failures()
+            retry = True
+
+        if (
+            not retry
+            and self.state.suspicious
+            and await self.app.push_screen_wait(
+                QuestionModal("Queue fully processed. Retry suspicious items?")
             )
-        set_sticky_text(
-            f"\033[92mCompleted: {len(self.state.completed)}\033[0m  -  "
-            f"\033[91mFailed: {total_failures}\033[0m  -  "
-            f"\033[93mTotal: {len(self.state.completed) + total_failures}/{total} ({percent:.2f}%)\033[0m  -  "
-            f"\033[96mRemaining: {humanized_eta(self.state.time_estimate)}\033[0m"
-        )
+        ):
+            self.state.requeue_suspicious()
+            retry = True
 
-    @handle_user_interrupts
-    def run(self) -> None:
-        if not self.setup():
-            return  # Setup failed, it should have printed an error
-        initial_queue_length = len(self.state.queue)
-        if initial_queue_length == 0:
-            return print_info("No series to process.")
-        initial_episode_count = self._calculate_total_episodes(self.state.queue)
-        current_failures = 0
-        start_time = datetime.now()
-        self.active_futures = {}
+        if retry:
+            self.state.save()
+            self.query_one("#log_view", Log).write_line("--- RETRYING ---")
+            self.start_processing()
+        else:
+            self.query_one("#log_view", Log).write_line(
+                "All Done. You may now exit the application."
+            )
+            self.app.bell()
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            for position, series_id in enumerate(self.state.queue.copy()):
-                # Check for abort conditions
-                if STOP_EVENT.is_set():
-                    break
-                if current_failures > self.max_failures:
-                    print_error("Script encountered too many failures! Aborting.")
-                    break
 
-                # Check if the series exists
-                series = self._get_series_by_id(series_id)
-                if not series:
-                    print_warning(
-                        f"Series with ID {series_id} missing from Sonarr (likely deleted by user). Skipping..."
+class SonarrRedownloader(App):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+
+    ModalScreen {
+        align: center middle;
+    }
+    
+    .modal {
+        background: $surface;
+        padding: 2;
+        border: heavy $accent;
+        width: 60;
+        height: auto;
+        align: center middle;
+    }
+    
+    .question {
+        text_align: center;
+        margin-bottom: 2;
+    }
+    
+    .buttons {
+        align: center middle;
+        height: auto;
+    }
+    
+    Button {
+        margin: 1;
+    }
+    
+    .config-container {
+        padding: 2;
+        width: 80;
+        align: center middle;
+        margin: 1;
+        border: heavy $primary;
+        background: $surface;
+    }
+    
+    .heading {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+        color: $accent-lighten-2;
+    }
+    
+    .help-text {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    
+    .submit-btn {
+        width: 100%;
+        margin-top: 2;
+    }
+
+    Checkbox {
+        border: none;
+        padding-left: 0;
+    }
+   
+    .status-box {
+        height: auto;
+        padding: 1;
+        margin-bottom: 1;
+        background: $surface;
+    }
+
+    .status-grid {
+        grid-size: 4;
+        grid-gutter: 2;
+        height: auto;
+    }
+
+    .status-item {
+        padding: 1;
+        border: none;
+        height: auto;
+        text-align: center;
+    }
+    
+    .box-completed {
+        background: $success-darken-3;
+        color: $text;
+        border-left: wide $success;
+    }
+    
+    .box-failed {
+        background: $error-darken-3;
+        color: $text;
+        border-left: wide $error;
+    }
+    
+    .box-total {
+        background: $primary-darken-3;
+        color: $text;
+        border-left: wide $primary;
+    }
+    
+    .box-remaining {
+        background: $warning-darken-3;
+        color: $text;
+        border-left: wide $warning;
+    }
+
+    .status-label {
+        color: $text-disabled;
+        text-align: center;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    
+    .status-value {
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        color: $text;
+    }
+
+    .failure {
+        color: $error-lighten-1;
+    }
+
+    ProgressBar, ProgressBar Bar {
+        width: 1fr;
+    }
+
+    Bar > .bar--indeterminate {
+        color: $primary;
+        background: $secondary;
+    }
+
+    Bar > .bar--bar {
+        color: $primary;
+        background: $primary 30%;
+    }
+
+    Bar > .bar--complete {
+        color: $error;
+    }
+
+    .percentage-text {
+        text-align: center;
+        margin-top: 1;
+        color: $text-muted;
+    }
+    
+    Log {
+        height: 1fr;
+        background: $surface;
+        padding: 1;
+        scrollbar-size: 0 1;
+        scrollbar-color:  $primary;
+        scrollbar-background: $secondary;
+        scrollbar-corner-color: $secondary;
+    }
+    """
+
+    def __init__(self, dummy_mode: bool = False):
+        super().__init__()
+        self.state_manager = StateManager(dummy_mode=dummy_mode)
+
+    def on_mount(self):
+        self.check_setup()
+
+    async def action_quit(self):
+        STOP_EVENT.set()
+        self.exit()
+
+    @work
+    async def check_setup(self):
+        has_state = self.state_manager.load()
+
+        if has_state:
+            action = await self.push_screen_wait(StartupModal())
+            if action == "quit":
+                await self.action_quit()
+                return
+
+            should_resume = action == "resume"
+            if should_resume:
+                # Ask about re-queueing failed/suspicious
+                if self.state_manager.failures or self.state_manager.suspicious:
+                    (
+                        requeue_failed,
+                        requeue_suspicious,
+                        new_speed,
+                    ) = await self.push_screen_wait(
+                        ResumeModal(
+                            len(self.state_manager.failures),
+                            len(self.state_manager.suspicious),
+                            self.state_manager.speed or 2,
+                        )
                     )
-                    continue
 
-                # Update progress information
-                self.update_status(
-                    initial_queue_length,
-                    initial_episode_count,
-                    position,
-                    current_failures,
-                    start_time,
-                )
+                    self.state_manager.speed = cast(Literal[0, 1, 2, 3, 4], new_speed)
 
-                # Send a "series search" command to Sonarr
-                command_id = self.client.search_series(series_id)
-                if not command_id:
-                    msg(
-                        series["title"],
-                        "Sonarr did not respond to 'Series Search' command!",
-                        type="error",
+                    if requeue_failed:
+                        self.state_manager.requeue_failures()
+
+                    if requeue_suspicious:
+                        self.state_manager.requeue_suspicious()
+
+                    if requeue_failed or requeue_suspicious:
+                        self.state_manager.save()
+
+                # Try connecting with saved credentials
+                try:
+                    client = SonarrClient(
+                        self.state_manager.sonarr_url,
+                        self.state_manager.api_key,
+                        dummy_mode=self.state_manager.dummy_mode,
                     )
-                    current_failures += 1
-                    continue
-                else:
-                    msg(f"{series['title']}", "Search started.", type="info")
+                    series = (
+                        client.get_all_series()
+                    )  # Just to verify connectivity and get series for titles
+                    self.push_screen(MainScreen(self.state_manager, client, series))
+                    return
+                except Exception as e:
+                    await self.push_screen_wait(
+                        AlertModal(f"Could not resume: {e}. Please reconfigure.")
+                    )
 
-                # Wait for search to complete, depending on speed setting
-                if self.state.speed == 4:
-                    continue  # Fastest speed does not wait for task completion
-                f = executor.submit(
-                    self.client.wait_for_search, command_id, series["title"]
-                )
-                self.active_futures[f] = series_id
-                if len(self.active_futures) >= self.state.speed:
-                    current_failures += self._check_failure(self.active_futures)
-
-            # For speed 1 and 2: All tasks are within our internal queue. Wait for the last batch to complete.
-            while (
-                self.active_futures
-                and current_failures <= self.max_failures
-                and not STOP_EVENT.is_set()
-            ):
-                current_failures += self._check_failure(self.active_futures)
-
-        # Done
-        end_sticky_text()
-        print_success("Processing complete!")
+        # If not resumed or failed to resume
+        res = await self.push_screen_wait(ConfigurationScreen(self.state_manager))
+        if res:
+            client, series = res
+            self.push_screen(MainScreen(self.state_manager, client, series))
 
 
 if __name__ == "__main__":
-    app: Optional[SonarrRedownloader] = None
+    parser = argparse.ArgumentParser(description="Sonarr Redownloader TUI")
+    parser.add_argument(
+        "--dummy",
+        action="store_true",
+        help="Run in dummy mode (no actual searches, no state saving)",
+    )
+    args = parser.parse_args()
+
+    app = SonarrRedownloader(dummy_mode=args.dummy)
     try:
-        app = SonarrRedownloader()
         app.run()
-        app.retry_failures_prompt()
-        app.retry_suspicious_prompt()
-    except Exception as e:
-        end_sticky_text()
-        print_error(f"An unexpected error occurred: {e}")
+    finally:
+        STOP_EVENT.set()
+        sys.exit(0)
