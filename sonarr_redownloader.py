@@ -52,13 +52,13 @@ MAX_FAILURE_RATIO = 0.05  # 5% of total series can fail before aborting
 SUSPICIOUS_THRESHOLD = 10  # Seconds; searches completing faster are suspicious
 STOP_EVENT = threading.Event()
 PAUSE_EVENT = threading.Event()
-PAUSE_EVENT.set()
-SPEED_HELP_TEXT = (
-    "1: Slow (sequential)\n"
-    "2: Medium (two concurrent) [recommended]\n"
-    "3: Fast (three concurrent)\n"
-    "4: Turbo (infinite)"
-)
+
+SPEED_SETTINGS = {
+    1: ("Safe", "One search running sequentially. Slow but very unlikely to hit rate limits."),
+    2: ("Balanced", "Two searches running concurrently. Allows for Sonarr's third worker slot to do other tasks."),
+    3: ("Fast", "Three searches running concurrently. Maximizes Sonarr's worker limit. May hit indexer rate limits, and will slow down Sonarr's ability to do other tasks."),
+    4: ("Turbo", "Immediately submit all searches to Sonarr ('fire and forget'). Very likely to hit indexer rate limits. May prevent Sonarr from doing anything else for several days!"),
+}
 
 
 class TextualLogHandler(logging.Handler):
@@ -73,7 +73,7 @@ class TextualLogHandler(logging.Handler):
         self.log_widget.write_line(msg)
 
 
-def humanized_eta(seconds: int) -> str:
+def humanized_eta(seconds: int, default: str = "") -> str:
     """Convert seconds to a human-readable time estimate."""
     _min, sec = divmod(seconds, 60)
     _hr, min = divmod(_min, 60)
@@ -91,7 +91,7 @@ def humanized_eta(seconds: int) -> str:
     if sec > 0:
         time_parts.append(f"{sec} second{'s' if sec != 1 else ''}")
 
-    return " ".join(time_parts[:2]) if time_parts else "TBD"
+    return " ".join(time_parts[:2]) if time_parts else default
 
 
 def http_success(status_code: int) -> bool:
@@ -279,7 +279,7 @@ class SonarrClient:
                     seconds=float(s),
                 ).total_seconds()
             )
-        humanized_duration = humanized_eta(duration) if duration else "0 seconds"
+        humanized_duration = humanized_eta(duration, default="0 seconds")
 
         if not status:
             logger.error(f"[{series_title}] Failed to get command status.")
@@ -326,11 +326,12 @@ class QuestionModal(ModalScreen[bool]):
         self.dismiss(event.button.id == "yes")
 
 
-class StartupModal(ModalScreen[str]):
-    """Modal to ask about resuming, starting new, or quitting."""
+class StartupScreen(Screen[str]):
+    """Screen to ask about resuming, starting new, or quitting."""
 
     def compose(self) -> ComposeResult:
-        with Container(classes="modal"):
+        yield Header()
+        with Container(classes="config-container"):
             yield Label(
                 "Previous session detected. What would you like to do?",
                 classes="question",
@@ -339,6 +340,7 @@ class StartupModal(ModalScreen[str]):
                 yield Button("Resume", variant="success", id="resume")
                 yield Button("Start New", variant="primary", id="new")
                 yield Button("Quit", variant="error", id="quit")
+        yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id)
@@ -360,8 +362,10 @@ class AlertModal(ModalScreen[None]):
         self.dismiss(None)
 
 
-class ResumeModal(ModalScreen[tuple[bool, bool, int]]):
-    """Modal to ask about re-queueing failed and suspicious items."""
+class ResumeScreen(Screen[tuple[bool, bool, int]]):
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+    ]
 
     def __init__(self, failed_count: int, suspicious_count: int, current_speed: int):
         super().__init__()
@@ -370,7 +374,8 @@ class ResumeModal(ModalScreen[tuple[bool, bool, int]]):
         self.current_speed = current_speed
 
     def compose(self) -> ComposeResult:
-        with Container(classes="modal"):
+        yield Header()
+        with Container(classes="config-container"):
             yield Label("Resume Options", classes="heading")
             if self.failed_count or self.suspicious_count:
                 yield Label("Re-insert into queue:")
@@ -382,12 +387,16 @@ class ResumeModal(ModalScreen[tuple[bool, bool, int]]):
                     )
 
             yield Label("\nSpeed (1-4):")
-            yield Label(SPEED_HELP_TEXT, classes="help-text")
+            for speed, (label, tooltip) in SPEED_SETTINGS.items():
+                lbl = Label(f"{speed}: {label}", classes="help-text")
+                lbl.tooltip = tooltip
+                yield lbl
             yield Input(value=str(self.current_speed), id="speed", type="number")
 
             with Horizontal(classes="buttons"):
                 yield Button("Continue", variant="primary", id="submit")
                 yield Button("Quit", variant="error", id="quit")
+        yield Footer()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "submit":
@@ -431,6 +440,9 @@ class ResumeModal(ModalScreen[tuple[bool, bool, int]]):
 
 class ConfigurationScreen(Screen):
     """Screen for configuring connection and preferences."""
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+    ]
 
     def __init__(self, state_manager: StateManager):
         super().__init__()
@@ -459,7 +471,10 @@ class ConfigurationScreen(Screen):
 
             yield Rule()
             yield Label("Speed (1-4):")
-            yield Label(SPEED_HELP_TEXT, classes="help-text")
+            for speed, (label, tooltip) in SPEED_SETTINGS.items():
+                lbl = Label(f"{speed}: {label}", classes="help-text")
+                lbl.tooltip = tooltip
+                yield lbl
             yield Input(value=str(self.state.speed or 2), id="speed", type="number")
 
             yield Button("Start", variant="success", id="start", classes="submit-btn")
@@ -568,20 +583,44 @@ class MainScreen(Screen):
         Binding("shift+e", "end", "End Task"),
     ]
 
+    def update_progress_text(self):
+        progress = self.query_one("#progress_bar", ProgressBar)
+        if not progress:
+            return
+
+        # Explicitly calculate percentage to ensure 0-100 scale
+        if progress.total and progress.total > 0:
+            percent = (progress.progress / progress.total) * 100
+        else:
+            percent = 0
+
+        eta = humanized_eta(self.state.time_estimate, default="Calculating time") + " remaining"
+        if STOP_EVENT.is_set():
+            eta += " (STOPPED)"
+        elif PAUSE_EVENT.is_set():
+            eta += " (PAUSED)"
+            
+        self.query_one("#percentage_text", Static).update(
+            f"{percent:.1f}% Complete\n{eta}"
+        )
+
     def action_end(self):
+        if not STOP_EVENT.is_set():
+            logger.info("Stopping current task...")
         STOP_EVENT.set()
-        self.query_one("#remaining_time", Static).update("STOPPING...")
-        logger.info("Ending current task by user hotkey.")
+        self.update_progress_text()
+        
 
     def action_toggle_pause(self):
-        if PAUSE_EVENT.is_set():
+        if STOP_EVENT.is_set():
+            logger.info("Cannot pause/resume while stopped.")
+        elif PAUSE_EVENT.is_set():
             PAUSE_EVENT.clear()
-            logger.info("Paused by user.")
-            self.query_one("#remaining_time", Static).update("PAUSED")
+            logger.info("Resumed by user.")
         else:
             PAUSE_EVENT.set()
-            logger.info("Resumed by user.")
-            self.query_one("#remaining_time", Static).update("Resuming...")
+            logger.info("Paused by user.")
+        self.update_progress_text()
 
     def __init__(
         self, state_manager: StateManager, client: SonarrClient, all_series: List[Dict]
@@ -611,17 +650,13 @@ class MainScreen(Screen):
                             "0", id="failed_count", classes="status-value failure"
                         )
 
+                    with Vertical(classes="status-item box-suspicious"):
+                        yield Label("Suspicious", classes="status-label")
+                        yield Static("0", id="suspicious_count", classes="status-value")
+
                     with Vertical(classes="status-item box-total"):
                         yield Label("Total", classes="status-label")
                         yield Static("0", id="total_count", classes="status-value")
-
-                    with Vertical(classes="status-item box-remaining"):
-                        yield Label("Remaining", classes="status-label")
-                        yield Static(
-                            "Calculating...",
-                            id="remaining_time",
-                            classes="status-value",
-                        )
 
                 yield Static("", id="percentage_text", classes="percentage-text")
                 yield ProgressBar(
@@ -665,8 +700,9 @@ class MainScreen(Screen):
                 if STOP_EVENT.is_set():
                     break
 
-                # Wait during a pause event (user might also issue a `stop` while paused, so we must check that too)
-                while not PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+                # Infinitely wait during 'PAUSE'
+                # The user might also issue a `stop` while paused, so we must check that.
+                while PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
                     time.sleep(0.5)
 
                 if current_failures > self.max_failures:
@@ -683,6 +719,7 @@ class MainScreen(Screen):
                     self.update_status,
                     len(self.state.completed),
                     len(self.state.failures),
+                    len(self.state.suspicious),
                     initial_queue_len,
                     total_episodes,
                 )
@@ -808,6 +845,7 @@ class MainScreen(Screen):
             self.update_status,
             len(self.state.completed),
             len(self.state.failures),
+            len(self.state.suspicious),
             initial_queue_len,
             initial_total_episodes,
         )
@@ -817,6 +855,7 @@ class MainScreen(Screen):
         self,
         completed: int,
         failed: int,
+        suspicious: int,
         initial_queue_len: int,
         initial_total_ep: int,
     ):
@@ -827,28 +866,24 @@ class MainScreen(Screen):
         progress = self.query_one("#progress_bar", ProgressBar)
         progress.total = total_items
         progress.progress = completed + failed
-        percent = ((completed + failed) / total_items * 100) if total_items > 0 else 0
 
         self.query_one("#completed_count", Static).update(str(completed))
         self.query_one("#failed_count", Static).update(str(failed))
+        self.query_one("#suspicious_count", Static).update(str(suspicious))
         self.query_one("#total_count", Static).update(str(total_items))
-        self.query_one("#percentage_text", Static).update(f"{percent:.1f}% Complete")
 
         if not PAUSE_EVENT.is_set():
-            self.query_one("#remaining_time", Static).update("PAUSED")
-            return
-        self._calculate_time_estimate(
-            initial_queue_len, initial_total_ep, self.start_time
-        )
-        self.query_one("#remaining_time", Static).update(
-            humanized_eta(self.state.time_estimate)
-        )
+            self._calculate_time_estimate(
+                initial_queue_len, initial_total_ep, self.start_time
+            )
+
+        self.update_progress_text()
 
     async def finished_processing(self):
         logger.info("Processing complete!")
         retry = False
         if self.state.failures and await self.app.push_screen_wait(
-            QuestionModal("Queue fully processed. Retry failed items?")
+            QuestionModal("Retry failed items?")
         ):
             self.state.requeue_failures()
             retry = True
@@ -857,7 +892,7 @@ class MainScreen(Screen):
             not retry
             and self.state.suspicious
             and await self.app.push_screen_wait(
-                QuestionModal("Queue fully processed. Retry suspicious items?")
+                QuestionModal("Retry suspicious items?")
             )
         ):
             self.state.requeue_suspicious()
@@ -909,12 +944,18 @@ class SonarrRedownloader(App):
     
     .config-container {
         padding: 2;
-        width: 80;
+        width: 100%;
+        height: 1fr;
         align: center middle;
-        margin: 1;
-        border: heavy $primary;
         background: $surface;
+        overflow-y: auto;
     }
+
+    .config-container > * {
+        width: 100%;
+        max-width: 100;
+    }
+
     
     .heading {
         text-align: center;
@@ -925,11 +966,9 @@ class SonarrRedownloader(App):
     
     .help-text {
         color: $text-muted;
-        margin-bottom: 1;
     }
     
     .submit-btn {
-        width: 100%;
         margin-top: 2;
     }
 
@@ -947,7 +986,7 @@ class SonarrRedownloader(App):
 
     .status-grid {
         grid-size: 4;
-        grid-gutter: 2;
+        grid-gutter: 1;
         height: auto;
     }
 
@@ -969,17 +1008,17 @@ class SonarrRedownloader(App):
         color: $text;
         border-left: wide $error;
     }
+
+    .box-suspicious {
+        background: $accent-darken-3;
+        color: $text;
+        border-left: wide $accent;
+    }
     
     .box-total {
         background: $primary-darken-3;
         color: $text;
         border-left: wide $primary;
-    }
-    
-    .box-remaining {
-        background: $warning-darken-3;
-        color: $text;
-        border-left: wide $warning;
     }
 
     .status-label {
@@ -1051,7 +1090,7 @@ class SonarrRedownloader(App):
         has_state = self.state_manager.load()
 
         if has_state:
-            action = await self.push_screen_wait(StartupModal())
+            action = await self.push_screen_wait(StartupScreen())
             if action == "quit":
                 await self.action_quit()
                 return
@@ -1065,7 +1104,7 @@ class SonarrRedownloader(App):
                         requeue_suspicious,
                         new_speed,
                     ) = await self.push_screen_wait(
-                        ResumeModal(
+                        ResumeScreen(
                             len(self.state_manager.failures),
                             len(self.state_manager.suspicious),
                             self.state_manager.speed or 2,
