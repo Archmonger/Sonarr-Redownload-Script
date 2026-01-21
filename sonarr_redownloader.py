@@ -85,7 +85,10 @@ class TextualLogHandler(logging.Handler):
 
     def emit(self, record):
         msg = self.format(record)
-        self.log_widget.write_line(msg)
+        if threading.current_thread() is threading.main_thread():
+            self.log_widget.write_line(msg)
+        else:
+            self.log_widget.app.call_from_thread(self.log_widget.write_line, msg)
 
 
 def humanized_eta(seconds: int, default: str = "") -> str:
@@ -941,9 +944,16 @@ class MainScreen(Screen):
             logger.info("Cannot pause/resume while stopped.")
         elif PAUSE_EVENT.is_set():
             PAUSE_EVENT.clear()
+            if self.last_pause_start:
+                paused_duration = (
+                    datetime.now() - self.last_pause_start
+                ).total_seconds()
+                self.total_paused_seconds += paused_duration
+                self.last_pause_start = None
             logger.info("Resumed by user.")
         else:
             PAUSE_EVENT.set()
+            self.last_pause_start = datetime.now()
             logger.info("Paused by user.")
         self.update_progress_text()
 
@@ -959,6 +969,10 @@ class MainScreen(Screen):
         # Progress Tracking
         self.initial_queue_length = len(self.state.queue)
         self.start_time = datetime.now()
+
+        # Pause Tracking
+        self.total_paused_seconds = 0.0
+        self.last_pause_start = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1110,6 +1124,12 @@ class MainScreen(Screen):
         if remaining_searches < queue_length:
             remaining_eps = self._calculate_total_episodes(self.state.queue)
             elapsed = (datetime.now() - start_time).total_seconds()
+
+            # Adjust for pause time
+            elapsed -= self.total_paused_seconds
+            if PAUSE_EVENT.is_set() and self.last_pause_start:
+                elapsed -= (datetime.now() - self.last_pause_start).total_seconds()
+
             if elapsed <= 0:
                 return
 
@@ -1493,7 +1513,7 @@ if __name__ == "__main__":
             pid = LOCK_FILE.read_text().strip()
             print(f"Error: Another instance is running (PID {pid}).")
             delete_lockfile = input("If you are sure no other instance is running, type 'Y' to continue: ")
-            if delete_lockfile == "Y":
+            if delete_lockfile.lower() == "y":
                 LOCK_FILE.unlink()
                 print("Lock file deleted. Continuing...")
             else:
