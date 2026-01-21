@@ -1,7 +1,9 @@
 import argparse
+import atexit
 import contextlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -36,10 +38,12 @@ from textual.widgets import (
 )
 
 # Set up logging for file (console logging will be handled by Textual)
+DATA_PATH = Path("redownloader_data")
+DATA_PATH.mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[FileHandler("redownloader.log", encoding="utf-8")],
+    handlers=[FileHandler(DATA_PATH /"redownloader.log", encoding="utf-8")],
 )
 logger = logging.getLogger(__name__)
 
@@ -158,7 +162,7 @@ def http_success(status_code: int) -> bool:
 
 
 class StateManager:
-    STATE_FILE = Path("redownloader_state.json")
+    STATE_FILE = DATA_PATH / "redownloader.json"
 
     def __init__(self, dummy_mode: bool = False):
         self.dummy_mode = dummy_mode
@@ -1482,9 +1486,37 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # Simple file lock to prevent multiple instances
+    LOCK_FILE = DATA_PATH / "redownloader.lock"
+    if LOCK_FILE.exists():
+        try:
+            pid = LOCK_FILE.read_text().strip()
+            print(f"Error: Another instance is running (PID {pid}).")
+            delete_lockfile = input("If you are sure no other instance is running, type 'Y' to continue: ")
+            if delete_lockfile == "Y":
+                LOCK_FILE.unlink()
+                print("Lock file deleted. Continuing...")
+            else:
+                sys.exit(1)
+        except Exception:
+            print("Error: Lock file 'redownloader.lock' exists. Another instance may be running.")
+            sys.exit(1)
+
+    with open(LOCK_FILE, "x") as f:
+        f.write(str(os.getpid()))
+
+    def cleanup_lock():
+        """Remove the lock file on exit."""
+        if LOCK_FILE.exists():
+            with contextlib.suppress(Exception):
+                LOCK_FILE.unlink()
+
+    atexit.register(cleanup_lock)
+
     app = SonarrRedownloader(dummy_mode=args.dummy)
     try:
         app.run()
     finally:
         STOP_EVENT.set()
+        cleanup_lock()
         sys.exit(0)
