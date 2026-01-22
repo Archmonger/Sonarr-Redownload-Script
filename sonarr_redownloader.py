@@ -979,13 +979,14 @@ class MainScreen(Screen):
         with Container(classes="main-container"):
             with Container(classes="status-box"):
                 with Grid(classes="status-grid"):
+                    with Vertical(classes="status-item box-total"):
+                        yield Label("Remaining", classes="status-label")
+                        yield Static("0", id="remaining_count", classes="status-value")
+
                     with Vertical(classes="status-item box-completed"):
                         yield Label("Completed", classes="status-label")
                         yield Static("0", id="completed_count", classes="status-value")
 
-                    with Vertical(classes="status-item box-total"):
-                        yield Label("Remaining", classes="status-label")
-                        yield Static("0", id="remaining_count", classes="status-value")
 
                     with Vertical(classes="status-item box-failed"):
                         yield Label("Failed", classes="status-label")
@@ -1220,8 +1221,8 @@ class MainScreen(Screen):
         progress.total = total_items
         progress.progress = completed + failed
 
-        self.query_one("#completed_count", Static).update(str(completed))
         self.query_one("#remaining_count", Static).update(str(len(self.state.queue)))
+        self.query_one("#completed_count", Static).update(str(completed))
         self.query_one("#failed_count", Static).update(str(failed))
         self.query_one("#suspicious_count", Static).update(str(suspicious))
 
