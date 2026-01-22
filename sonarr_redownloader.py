@@ -43,7 +43,7 @@ DATA_PATH.mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[FileHandler(DATA_PATH /"redownloader.log", encoding="utf-8")],
+    handlers=[FileHandler(DATA_PATH / "redownloader.log", encoding="utf-8")],
 )
 logger = logging.getLogger(__name__)
 
@@ -983,6 +983,10 @@ class MainScreen(Screen):
                         yield Label("Completed", classes="status-label")
                         yield Static("0", id="completed_count", classes="status-value")
 
+                    with Vertical(classes="status-item box-total"):
+                        yield Label("Remaining", classes="status-label")
+                        yield Static("0", id="remaining_count", classes="status-value")
+
                     with Vertical(classes="status-item box-failed"):
                         yield Label("Failed", classes="status-label")
                         yield Static(
@@ -992,10 +996,6 @@ class MainScreen(Screen):
                     with Vertical(classes="status-item box-suspicious"):
                         yield Label("Suspicious", classes="status-label")
                         yield Static("0", id="suspicious_count", classes="status-value")
-
-                    with Vertical(classes="status-item box-total"):
-                        yield Label("Total", classes="status-label")
-                        yield Static("0", id="total_count", classes="status-value")
 
                 yield Static("", id="percentage_text", classes="percentage-text")
                 yield ProgressBar(
@@ -1129,32 +1129,40 @@ class MainScreen(Screen):
             elapsed -= self.total_paused_seconds
             if PAUSE_EVENT.is_set() and self.last_pause_start:
                 elapsed -= (datetime.now() - self.last_pause_start).total_seconds()
-
             if elapsed <= 0:
                 return
 
             # Time estimate based on remaining episodes
-            eps_completed = episode_count - remaining_eps + 1
+            eps_completed = episode_count - remaining_eps
             est_ep = (
                 (elapsed / eps_completed) * remaining_eps if eps_completed > 0 else 0
             )
 
             # Time estimate based on remaining series count
-            session_completed = queue_length - remaining_searches + 1
+            session_completed = queue_length - remaining_searches
             if session_completed > 0:
                 est_series = (elapsed / session_completed) * remaining_searches
             else:
                 est_series = 0
 
             # Set the value within the state storage
-            # Average with previous estimate for smoothing, if possible
-            if est_ep > 0 or est_series > 0:
+            new_estimate = 0
+            if est_ep > 0 and est_series > 0:
                 new_estimate = int((est_ep + est_series) / 2)
-                self.state.time_estimate = (
-                    int((self.state.time_estimate + new_estimate) / 2)
-                    if self.state.time_estimate > 0
-                    else new_estimate
-                )
+            elif est_ep > 0:
+                new_estimate = int(est_ep)
+            elif est_series > 0:
+                new_estimate = int(est_series)
+
+            # Average with previous estimate for smoothing, if possible
+            if new_estimate > 0:
+                if self.state.time_estimate > 0:
+                    # Weight recent estimate lower to reduce volatility
+                    self.state.time_estimate = int(
+                        self.state.time_estimate * 0.9 + new_estimate * 0.1
+                    )
+                else:
+                    self.state.time_estimate = new_estimate
 
     def _check_failure(
         self,
@@ -1213,9 +1221,9 @@ class MainScreen(Screen):
         progress.progress = completed + failed
 
         self.query_one("#completed_count", Static).update(str(completed))
+        self.query_one("#remaining_count", Static).update(str(len(self.state.queue)))
         self.query_one("#failed_count", Static).update(str(failed))
         self.query_one("#suspicious_count", Static).update(str(suspicious))
-        self.query_one("#total_count", Static).update(str(total_items))
 
         if not PAUSE_EVENT.is_set():
             self._calculate_time_estimate(
@@ -1512,14 +1520,18 @@ if __name__ == "__main__":
         try:
             pid = LOCK_FILE.read_text().strip()
             print(f"Error: Another instance is running (PID {pid}).")
-            delete_lockfile = input("If you are sure no other instance is running, type 'Y' to continue: ")
+            delete_lockfile = input(
+                "If you are sure no other instance is running, type 'Y' to continue: "
+            )
             if delete_lockfile.lower() == "y":
                 LOCK_FILE.unlink()
                 print("Lock file deleted. Continuing...")
             else:
                 sys.exit(1)
         except Exception:
-            print("Error: Lock file 'redownloader.lock' exists. Another instance may be running.")
+            print(
+                "Error: Lock file 'redownloader.lock' exists. Another instance may be running."
+            )
             sys.exit(1)
 
     with open(LOCK_FILE, "x") as f:
