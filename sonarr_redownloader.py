@@ -405,7 +405,7 @@ class FilterModal(ModalScreen):
             yield Label("Monitored Only:")
             yield Select(
                 [("Yes", True), ("No", False)],
-                value=False,
+                value=True,
                 id="monitored",
                 allow_blank=False,
             )
@@ -734,7 +734,7 @@ class ConfigurationScreen(Screen):
             yield Label("Monitored Only:")
             yield Select(
                 [("Yes", True), ("No", False)],
-                value=False,
+                value=True,
                 id="monitored",
                 allow_blank=False,
             )
