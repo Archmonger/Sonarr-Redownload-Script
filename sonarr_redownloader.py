@@ -1051,7 +1051,9 @@ class MainScreen(Screen):
 
                 series = self._get_series_by_id(series_id)
                 if not series:
-                    logger.warning(f"Series ID {series_id} not found.")
+                    logger.warning(f"Series ID {series_id} has been removed from Sonarr. Skipping...")
+                    self.state.queue.remove(series_id)
+                    self.state.save()
                     continue
 
                 # Update UI
