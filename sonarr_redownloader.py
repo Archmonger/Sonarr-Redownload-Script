@@ -32,7 +32,6 @@ from textual.widgets import (
     Label,
     Log,
     ProgressBar,
-    Rule,
     Select,
     Static,
 )
@@ -294,6 +293,10 @@ class SonarrClient:
             return response.json()
         raise ConnectionError("Failed to retrieve series list from Sonarr.")
 
+    def get_episode_files(self, series_id: int) -> List[Dict]:
+        response = self._request("GET", "/episodefile", params={"seriesId": series_id})
+        return response.json() if response else []
+
     def search_series(self, series_id: int) -> Optional[int]:
         """Triggers a SeriesSearch and returns the command ID."""
         if self.dummy_mode:
@@ -370,6 +373,26 @@ class SonarrClient:
 
 # --- UI Screens ---
 
+class ProgressModal(ModalScreen):
+    """Modal to show progress of a long-running task."""
+
+    def __init__(self, title: str, total: int):
+        super().__init__()
+        self.title = title
+        self.total = total
+
+    def compose(self) -> ComposeResult:
+        with Container(classes="modal"):
+            yield Label(self.title or "", classes="heading")
+            yield ProgressBar(total=self.total, show_eta=True, id="progress")
+            yield Label("Processing...", id="status_label")
+
+    def update_progress(self, advance: float, message: str = ""):
+        pb = self.query_one(ProgressBar)
+        pb.advance(advance)
+        if message:
+            self.query_one("#status_label", Label).update(message)
+
 
 class QuestionModal(ModalScreen[bool]):
     """A simple Yes/No modal."""
@@ -429,6 +452,21 @@ class FilterModal(ModalScreen):
             yield Input(placeholder="e.g. 2025", id="max_year", type="number")
             yield Label("Genre (Optional):")
             yield Input(placeholder="e.g. Action", id="genre")
+            yield Label("\n[b]Advanced Filters (Slow)[/b]", classes="heading")
+            yield Label("Only include series with 'Cutoff Unmet' files:")
+            yield Select(
+                [("Yes", True), ("No", False)],
+                value=False,
+                id="cutoff_unmet",
+                allow_blank=False,
+            )
+            yield Label("Only include series with negative 'Custom Format Score' files:")
+            yield Select(
+                [("Yes", True), ("No", False)],
+                value=False,
+                id="negative_score",
+                allow_blank=False,
+            )
 
             with Horizontal(classes="buttons"):
                 yield Button("Apply", variant="primary", id="apply")
@@ -451,6 +489,8 @@ class FilterModal(ModalScreen):
         series_type = self.query_one("#series_type", Select).value
         monitored_val = self.query_one("#monitored", Select).value
         monitored = cast(bool, monitored_val)
+        cutoff_unmet = cast(bool, self.query_one("#cutoff_unmet", Select).value)
+        negative_score = cast(bool, self.query_one("#negative_score", Select).value)
 
         try:
             max_eps = int(max_eps_str) if max_eps_str else float("inf")
@@ -467,7 +507,11 @@ class FilterModal(ModalScreen):
         except ValueError:
             max_year = 0
 
-        loading_screen = AlertModal("Connecting to Sonarr...", dismissable=False)
+        if cutoff_unmet or negative_score:
+            loading_screen = ProgressModal("Deep Scanning Filters...", 100) # Total will be updated
+        else:
+            loading_screen = AlertModal("Connecting to Sonarr...", dismissable=False)
+        
         self.app.push_screen(loading_screen)
         self.run_connection_and_filter(
             root_dir,
@@ -478,6 +522,8 @@ class FilterModal(ModalScreen):
             status,
             series_type,
             monitored,
+            cutoff_unmet,
+            negative_score,
             loading_screen,
         )
 
@@ -492,6 +538,8 @@ class FilterModal(ModalScreen):
         status,
         series_type,
         monitored,
+        cutoff_unmet,
+        negative_score,
         loading_modal,
     ):
         try:
@@ -521,6 +569,36 @@ class FilterModal(ModalScreen):
             series_type,
             monitored,
         )
+
+        if cutoff_unmet or negative_score:
+            if isinstance(loading_modal, ProgressModal):
+                def set_total():
+                    loading_modal.query_one(ProgressBar).update(total=len(queue), progress=0)
+                self.app.call_from_thread(set_total)
+
+            filtered_queue = []
+            for i, sid in enumerate(queue):
+                try:
+                    eps = client.get_episode_files(sid)
+                    include = False
+                    for ep in eps:
+                        if cutoff_unmet and ep.get("qualityCutoffNotMet"):
+                            include = True
+                            break
+                        if negative_score and ep.get("customFormatScore", 0) < 0:
+                            include = True
+                            break
+                    if include:
+                        filtered_queue.append(sid)
+                except Exception as e:
+                    logger.error(f"Error filtering series {sid}: {e}")
+
+                if isinstance(loading_modal, ProgressModal):
+                    self.app.call_from_thread(
+                        loading_modal.update_progress, 1, f"Checking {i + 1}/{len(queue)}"
+                    )
+            
+            queue = filtered_queue
 
         self.app.call_from_thread(loading_modal.dismiss, None)
 
@@ -730,7 +808,7 @@ class ConfigurationScreen(Screen):
                 id="speed",
                 allow_blank=False,
             )
-            yield Rule()
+            yield Label("\n[b]Filters[/b]", classes="heading")
             yield Label("Monitored Only:")
             yield Select(
                 [("Yes", True), ("No", False)],
@@ -758,6 +836,21 @@ class ConfigurationScreen(Screen):
             yield Input(placeholder="e.g. 2025", id="max_year", type="number")
             yield Label("Genre (Optional):")
             yield Input(placeholder="e.g. Action", id="genre")
+            yield Label("\n[b]Advanced Filters (Slow)[/b]", classes="heading")
+            yield Label("Only include series with 'Cutoff Unmet' files:")
+            yield Select(
+                [("Yes", True), ("No", False)],
+                value=False,
+                id="cutoff_unmet",
+                allow_blank=False,
+            )
+            yield Label("Only include series with negative 'Custom Format Score' files:")
+            yield Select(
+                [("Yes", True), ("No", False)],
+                value=False,
+                id="negative_score",
+                allow_blank=False,
+            )
 
             yield Button("Start", variant="success", id="start", classes="submit-btn")
         yield Footer()
@@ -785,6 +878,8 @@ class ConfigurationScreen(Screen):
         series_type = self.query_one("#series_type", Select).value
         monitored_val = self.query_one("#monitored", Select).value
         monitored = cast(bool, monitored_val)
+        cutoff_unmet = cast(bool, self.query_one("#cutoff_unmet", Select).value)
+        negative_score = cast(bool, self.query_one("#negative_score", Select).value)
 
         if not url or not key:
             self.app.push_screen(AlertModal("URL and API Key are required."))
@@ -830,7 +925,11 @@ class ConfigurationScreen(Screen):
         # But the 'Resume' flow skips this screen. So we can assume new filters apply.
         # However, we need to fetch series first to filter.
 
-        loading_screen = AlertModal("Connecting to Sonarr...", dismissable=False)
+        if cutoff_unmet or negative_score:
+            loading_screen = ProgressModal("Deep Scanning Filters...", 100) # Total will be updated
+        else:
+            loading_screen = AlertModal("Connecting to Sonarr...", dismissable=False)
+        
         self.app.push_screen(loading_screen)
 
         # Run connection check in worker to not block UI
@@ -845,6 +944,8 @@ class ConfigurationScreen(Screen):
             status,
             series_type,
             monitored,
+            cutoff_unmet,
+            negative_score,
             loading_screen,
         )
 
@@ -861,6 +962,8 @@ class ConfigurationScreen(Screen):
         status,
         series_type,
         monitored,
+        cutoff_unmet,
+        negative_score,
         loading_modal,
     ):
         try:
@@ -888,6 +991,36 @@ class ConfigurationScreen(Screen):
             series_type,
             monitored,
         )
+
+        if cutoff_unmet or negative_score:
+            if isinstance(loading_modal, ProgressModal):
+                def set_total():
+                    loading_modal.query_one(ProgressBar).update(total=len(queue), progress=0)
+                self.app.call_from_thread(set_total)
+
+            filtered_queue = []
+            for i, sid in enumerate(queue):
+                try:
+                    eps = client.get_episode_files(sid)
+                    include = False
+                    for ep in eps:
+                        if cutoff_unmet and ep.get("qualityCutoffNotMet"):
+                            include = True
+                            break
+                        if negative_score and ep.get("customFormatScore", 0) < 0:
+                            include = True
+                            break
+                    if include:
+                        filtered_queue.append(sid)
+                except Exception as e:
+                    logger.error(f"Error filtering series {sid}: {e}")
+
+                if isinstance(loading_modal, ProgressModal):
+                    self.app.call_from_thread(
+                        loading_modal.update_progress, 1, f"Checking {i + 1}/{len(queue)}"
+                    )
+            
+            queue = filtered_queue
 
         self.app.call_from_thread(loading_modal.dismiss, None)
 
