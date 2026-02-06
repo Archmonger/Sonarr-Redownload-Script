@@ -47,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Globals
-MAX_SEARCH_WAIT = 10800  # Time in seconds
+MAX_SEARCH_WAIT = 21600  # Time in seconds
 MAX_CONNECTION_RETRIES = 10  # Number of HTTP connection retries allowed
 INITIAL_CONNECTION_RETRY_DELAY = 10  # Initial timeout in seconds
 CHECK_STATUS_INTERVAL = 10  # Time in seconds between status checks
