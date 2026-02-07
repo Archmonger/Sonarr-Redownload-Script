@@ -1295,7 +1295,7 @@ class MainScreen(Screen):
                 if self.state.time_estimate > 0:
                     # Weight recent estimate lower to reduce volatility
                     self.state.time_estimate = int(
-                        self.state.time_estimate * 0.9 + new_estimate * 0.1
+                        self.state.time_estimate * 0.8 + new_estimate * 0.2
                     )
                 else:
                     self.state.time_estimate = new_estimate
